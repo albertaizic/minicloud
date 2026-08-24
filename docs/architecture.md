@@ -31,7 +31,7 @@ graph TB
         CONTAINERS[Managed containers<br/>labels: minicloud.*]
     end
 
-    DB[(PostgreSQL<br/>apps + deployments)]
+    DB[(PostgreSQL<br/>apps + deployments + app_env)]
 
     CLI --> REST
     UI --> REST
@@ -67,7 +67,14 @@ QUEUED → CLONING → BUILDING → STARTING → HEALTH_CHECKING → RUNNING
 2. **Build** — requires a root-level `Dockerfile`. Image tag: `minicloud/app-<id8>:d-<depId12>`. Build output is streamed to log listeners.
 3. **Port allocation** — random candidates from a configurable range, each probed with a bind test immediately before use. Docker's own bind is the final arbiter; collisions surface as clear start errors.
 4. **Start** — container created with labels `minicloud.managed`, `minicloud.app`, `minicloud.deployment`. Never privileged, no host mounts, no restart policy (crash handling is explicit).
-5. **Health check** — HTTP GET on `<host>:<port><healthPath>` until success or timeout.
+   Before creating the container the engine resolves the application's effective
+   runtime configuration through a callback registered by the API layer (which
+   owns the master key): plain env vars, decrypted secret values, and resource
+   limits. Secret values exist only inside this call path — they are never
+   logged and never persisted. The deployment's non-secret snapshot (plain
+   values, secret *key names*, limits) is written to `deployments.config_snapshot`.
+   Limits become cgroup controls on the container: `Memory` bytes with
+   `MemorySwap = Memory` (hard cap, no swap) and `NanoCpus` (`--cpus`).
 6. **RUNNING** — persisted with `started_at`.
 
 Concurrency: one in-flight operation per deployment via an in-process lock map;
@@ -96,7 +103,39 @@ fan-out with `source=build`. Nothing unbounded is held in memory (ring buffer of
 last 500 lines client-side).
 
 ### Persistence
-Two tables (`applications`, `deployments`) with a CHECK-constrained status enum,
-migrated by `packages/db`'s runner. Ephemeral runtime objects (containers,
-images) are always reconcilable from Docker; durable history lives only in
-PostgreSQL.
+
+Three tables (`applications`, `deployments`, `app_env`) with a CHECK-constrained
+status enum, migrated by `packages/db`'s runner. Ephemeral runtime objects
+(containers, images) are always reconcilable from Docker; durable history lives
+only in PostgreSQL.
+
+### Application configuration (v0.2)
+
+Per-application config lives in two places:
+
+- `app_env` table: one row per key per app. Plain variables store their value;
+  secrets store only AES-256-GCM ciphertext under an scrypt-stretched
+  operator master key. A CHECK constraint makes the two value shapes mutually
+  exclusive.
+- `applications.memory_limit_mb` / `cpu_limit`: current limits.
+
+Resolution flow at container start:
+
+```mermaid
+sequenceDiagram
+    participant E as Deployment Engine
+    participant A as API (owns master key)
+    participant DB as PostgreSQL
+    participant D as Docker
+    E->>A: resolveAppConfig(appId)
+    A->>DB: read app_env rows + limits
+    A-->>E: { env (plain + decrypted secrets), secretKeys, limits }
+    E->>DB: persist non-secret snapshot
+    E->>D: create container (env, Memory/MemorySwap/NanoCpus)
+```
+
+Failures in this stage fail the deployment cleanly (`config` stage reason), for
+example when secrets exist but `MINICLOUD_MASTER_KEY` is not configured.
+Restart re-runs resolution so containers pick up changed configuration without
+a rebuild; the snapshot is refreshed to stay truthful about the running
+container. Historical deployments keep their original snapshot.

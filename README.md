@@ -47,6 +47,12 @@ solve, at an understandable scale.
 - **Crash detection**: a monitor marks crashed deployments FAILED with the exit code
 - **Stop / restart / delete / redeploy**, all idempotent and concurrency-guarded
 - **Startup reconciliation**: DB and Docker are re-synced on every API boot; orphaned containers are cleaned up
+- **Environment variables & secrets** per application: plain vars are readable,
+  secrets are AES-256-GCM-encrypted at rest and write-only (never returned by
+  API, CLI or dashboard)
+- **CPU & memory limits** enforced with Docker cgroups (`--cpus`, hard memory cap)
+- **Deployment configuration snapshots**: each deployment records the effective
+  non-secret config it was started with
 - **REST API + CLI + web dashboard**
 - **PostgreSQL persistence** with migrations
 
@@ -59,7 +65,6 @@ graph LR
     API --> ENG[Deployment Engine]
     ENG --> D[(PostgreSQL)]
     ENG --> DK[Docker: build/run/health-check]
-```
 
 See [docs/architecture.md](docs/architecture.md) for the full architecture,
 deployment lifecycle, and reconciliation strategy.
@@ -132,8 +137,27 @@ minicloud delete <deployment-id>
 minicloud wait <deployment-id>
 ```
 
-During development, invoke it via `npx tsx apps/cli/src/minicloud.ts` or link
-the workspace.
+minicloud deploy <git-url> [--name my-app] [--ref main]
+minicloud apps
+minicloud deployments [app-name]
+minicloud status <deployment-id>
+minicloud logs <deployment-id>       # live stream
+minicloud stop <deployment-id>
+minicloud restart <deployment-id>
+minicloud delete <deployment-id>
+minicloud wait <deployment-id>
+
+# configuration (v0.2)
+minicloud env <app>                          # list vars + secret keys
+minicloud env set <app> KEY=VALUE
+minicloud env delete <app> KEY
+minicloud secret set <app> KEY               # value read hidden from stdin/TTY
+echo "$VALUE" | minicloud secret set <app> KEY   # piped input also works
+minicloud secret delete <app> KEY
+minicloud limits show <app>
+minicloud limits set <app> --memory 512 --cpu 1.5
+minicloud limits clear <app>
+```
 
 ## API overview
 
@@ -144,6 +168,14 @@ the workspace.
 | GET    | `/api/apps`              | List applications (+ latest deploy)  |
 | GET    | `/api/apps/:id`          | Application detail + deployments     |
 | DELETE | `/api/apps/:id`          | Delete app and its deployments       |
+| GET    | `/api/apps/:id/env`      | List env vars (values) + secret keys |
+| PUT    | `/api/apps/:id/env/:key`       | Set env var (`{"value": "..."}`) |
+| DELETE | `/api/apps/:id/env/:key`       | Delete env var or secret        |
+| PUT    | `/api/apps/:id/secrets/:key`   | Store/replace secret (write-only, 201) |
+| DELETE | `/api/apps/:id/secrets/:key`   | Delete secret                   |
+| GET    | `/api/apps/:id/limits`   | Show CPU/memory limits               |
+| PUT    | `/api/apps/:id/limits`   | Set limits (`memoryLimitMb`, `cpuLimit`) |
+| DELETE | `/api/apps/:id/limits`   | Clear limits                         |
 | POST   | `/api/apps/:id/deploy`   | Queue a deployment (202)             |
 | GET    | `/api/deployments`       | List deployments                     |
 | GET    | `/api/deployments/:id`   | Deployment detail                    |
@@ -154,6 +186,8 @@ the workspace.
 
 Validation errors return `400` with per-field details; impossible operations
 return `409`; unknown ids return `404`.
+Full request/response semantics for configuration endpoints: [docs/api.md](docs/api.md).
+
 
 ## Development
 
@@ -168,35 +202,44 @@ npm run build          # production builds
 
 ### Testing
 
-- **Unit tests** (state machine, URL validation, port allocation, git URL rules): no services required.
-- **API tests** (`apps/api/src/api.test.ts`): require PostgreSQL from `docker compose`.
-- **Integration tests** (`apps/api/src/pipeline.integration.test.ts`): require Docker + PostgreSQL; exercise the real clone/build/start/health-check/stop/restart/crash pipeline against `examples/`.
+- **Unit tests** (state machine, URL validation, port allocation, git URL rules,
+  secret encryption, config schema validation): no services required.
+- **API tests** (`api.test.ts`, `config.test.ts`): require PostgreSQL from
+  `docker compose`; cover env/secret/limits CRUD, redaction, and validation.
+- **Integration tests** (`pipeline.integration.test.ts`,
+  `config.integration.test.ts`): require Docker + PostgreSQL; exercise the real
+  clone/build/start/health-check pipeline plus env injection, real cgroup
+  limits (including an OOM-kill case) and redeploy/restart config behavior.
 
-## Current limitations (v0.1)
+## Current limitations (v0.2)
 
 - Public repositories only; no credentials, private repos, or monorepo path filters.
 - A root-level `Dockerfile` is required — no buildpack auto-detection yet.
 - Single-host, single-API-instance; the lock map is in-process (DB status guards prevent corruption, but two API instances could both attempt the same build).
-- Logs are streamed/tailed live; there is no long-term log storage or search.
+- Logs are streamed/tailed live; there is no long-term log storage or search. An app that prints its own secrets will stream them like any other output — MiniCloud does not redact container stdout.
 - No authentication or multi-user support.
 - No automatic restart policy or rollback (restart uses the same commit's image).
 - Health checks accept any HTTP response as "healthy" (even 500).
+- Secrets live in one Postgres column encrypted with one master key: rotating
+  `MINICLOUD_MASTER_KEY` requires re-entering secrets; losing it makes stored
+  secrets undecryptable (deployments using them then fail at the config stage).
 
 ## Roadmap
 
-1. Environment variables & secrets per app
-2. Bounded automatic restart with backoff
-3. Build log streaming polish + deployment event timeline
-4. Rollback to a previous successful deployment
-5. Resource limits (CPU/memory) via Docker stats
-6. Multi-repo subdirectory builds & buildpacks
+1. Bounded automatic restart with backoff
+2. Build log streaming polish + deployment event timeline
+3. Rollback to a previous successful deployment
+4. Multi-repo subdirectory builds & buildpacks
+5. Secret key rotation support (`MINICLOUD_MASTER_KEY_{NEW,OLD}` re-encryption)
 
 ## Security model
 
 MiniCloud treats repositories and their builds as **untrusted input**, but it is
 a single-user local development tool — not a hardened multi-tenant sandbox.
+See [docs/security.md](docs/security.md) for details on secret handling,
+threat model, and operator responsibilities.
 
-What v0.1 does:
+What v0.2 does:
 
 - Git URLs are strictly validated (https/ssh forms plus localhost http); shell
   metacharacters are rejected and git runs via argument-array `execFile`.
@@ -205,16 +248,24 @@ What v0.1 does:
 - Identifiers are UUID-validated before touching the filesystem; workspace paths
   are constructed internally (no traversal from user input).
 - API payloads are schema-validated; status codes are precise.
+- Secrets are encrypted at rest (AES-256-GCM under an scrypt-stretched master
+  key), never returned by any read endpoint, and injected only into the
+  container environment at start.
+- Env keys are restricted to `[A-Za-z_][A-Za-z0-9_]*` so user configuration can
+  never smuggle shell metacharacters or newlines into container environments.
+- Optional per-app CPU/memory limits give operators a lever against runaway
+  containers.
 
-What v0.1 does **not** do:
+What v0.2 does **not** do:
 
-- Containers can consume unbounded CPU/RAM/disk; no cgroups limits yet.
 - Built images execute arbitrary code from the repository during build *and* runtime — by design, but that means full host-level isolation must come from Docker itself, not MiniCloud.
-- The API has no authentication: anyone who can reach port 4000 can deploy anything Docker can do.
+- The API has no authentication: anyone who can reach port 4000 can deploy anything Docker can do (and read plain env vars).
+
 
 ## Release
 
-Current release: **v0.1.0** — see [CHANGELOG.md](CHANGELOG.md).
+Current release: **v0.1.0**; the working tree carries unreleased v0.2 work — see [CHANGELOG.md](CHANGELOG.md).
+
 
 ## License
 
