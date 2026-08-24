@@ -20,9 +20,11 @@ import {
   Database,
   DeploymentRepository,
   AppRepository,
+  AppConfigRepository,
   type DeploymentRow,
 } from '@minicloud/db';
-import { DockerRuntime, DockerUnavailableError } from '@minicloud/docker-runtime';
+import { buildConfigSnapshot, type ResourceLimits } from '@minicloud/shared';
+import { DockerRuntime, DockerUnavailableError, type ContainerResourceLimits } from '@minicloud/docker-runtime';
 import { cloneRepository } from './git.js';
 import { allocatePort, canBind } from './ports.js';
 import { waitForHealthy } from './health.js';
@@ -60,6 +62,20 @@ export type LogListener = (
   entry: { source: 'build' | 'container' | 'system'; stream: 'stdout' | 'stderr'; message: string },
 ) => void;
 
+/** Effective per-application runtime configuration, resolved at container start. */
+export interface ResolvedAppConfig {
+  /**
+   * Plain vars plus DECRYPTED secret values. This map goes straight into the
+   * container; the engine never logs it and persists only the non-secret part.
+   */
+  env: Record<string, string>;
+  /** Secret KEY names only — never values. Used for the config snapshot. */
+  secretKeys: string[];
+  limits: ResourceLimits | null;
+}
+
+export type AppConfigResolver = (applicationId: string) => Promise<ResolvedAppConfig>;
+
 const MAX_LOCK_MAP_SIZE = 500;
 
 export class DeploymentEngine {
@@ -69,7 +85,6 @@ export class DeploymentEngine {
   private readonly locks = new Map<string, Promise<unknown>>();
   /** AbortControllers for in-flight pipelines; used when stopping during startup. */
   private readonly activeRuns = new Map<string, AbortController>();
-
   constructor(
     private readonly db: Database,
     private readonly docker: DockerRuntime,
@@ -79,7 +94,50 @@ export class DeploymentEngine {
   ) {
     this.deployments = new DeploymentRepository(db);
     this.apps = new AppRepository(db);
+    this.appConfig = new AppConfigRepository(db);
     void mkdir(config.workspaceDir, { recursive: true });
+  }
+
+  private readonly appConfig: AppConfigRepository;
+
+  /**
+   * Resolves the effective runtime configuration (env, secrets, limits) for an
+   * application at container start. Registered by the API layer because it owns
+   * the master key; the engine itself never sees ciphertext or keys.
+   */
+  private appConfigResolver: AppConfigResolver | null = null;
+
+  setAppConfigResolver(resolver: AppConfigResolver): void {
+    this.appConfigResolver = resolver;
+  }
+
+  /** Resolve config, mapping any resolver failure to EngineError(stage='config'). */
+  private async resolvedConfig(applicationId: string): Promise<ResolvedAppConfig> {
+    if (!this.appConfigResolver) return { env: {}, secretKeys: [], limits: null };
+    try {
+      return await this.appConfigResolver(applicationId);
+    } catch (err) {
+      throw new EngineError(err instanceof Error ? err.message : String(err), 'config');
+    }
+  }
+
+  /** Non-secret snapshot for a resolved config: plain values + secret key names. */
+  private snapshotFor(cfg: ResolvedAppConfig): Record<string, unknown> {
+    return buildConfigSnapshot(
+      Object.fromEntries(Object.entries(cfg.env).filter(([k]) => !cfg.secretKeys.includes(k))),
+      cfg.secretKeys,
+      cfg.limits,
+    ) as unknown as Record<string, unknown>;
+  }
+
+  /** MB→bytes and CPUs→nano-CPUs; the only place Docker limit units are computed.
+   *  Null-checked rather than truthiness: a literal 0 must fail loudly upstream
+   *  (validation), never silently disappear here. */
+  private dockerLimits(limits: ResourceLimits | null): ContainerResourceLimits {
+    const out: ContainerResourceLimits = {};
+    if (limits?.memoryLimitMb != null) out.memoryBytes = limits.memoryLimitMb * 1024 * 1024;
+    if (limits?.cpuLimit != null) out.cpus = limits.cpuLimit;
+    return out;
   }
 
   get workspaceDir(): string {
@@ -246,6 +304,30 @@ export class DeploymentEngine {
     }
 
     const healthPath = row.health_path ?? this.config.defaults.healthPath;
+
+    // Resolve effective app configuration (env vars, secrets, resource limits)
+    // at container start. Secret VALUES live only in runtimeEnv — they go
+    // straight into the container and are never logged or persisted; the
+    // snapshot records plain values and secret KEY NAMES only.
+    let cfg: ResolvedAppConfig;
+    try {
+      cfg = await this.resolvedConfig(app.id);
+    } catch (err) {
+      await fail('config', err instanceof Error ? err.message : String(err));
+      await repoCleanup(repoDir);
+      return;
+    }
+    this.logger.info('app config resolved', {
+      deploymentId,
+      varCount: Object.keys(cfg.env).length - cfg.secretKeys.length,
+      secretCount: cfg.secretKeys.length,
+      memoryLimitMb: cfg.limits?.memoryLimitMb ?? null,
+      cpuLimit: cfg.limits?.cpuLimit ?? null,
+    });
+    await this.deployments.updateFields(deploymentId, {
+      config_snapshot: this.snapshotFor(cfg),
+    });
+
     let containerId: string;
     try {
       const started = await this.docker.startManagedContainer({
@@ -255,7 +337,8 @@ export class DeploymentEngine {
         deploymentLabel: deploymentId,
         containerPort,
         hostPort,
-        env: {},
+        env: cfg.env,
+        limits: this.dockerLimits(cfg.limits),
       });
       containerId = started.id;
     } catch (err) {
@@ -394,6 +477,11 @@ export class DeploymentEngine {
       const app = await this.apps.byId(row.application_id);
       if (!app) throw new EngineError('Application not found', 'restart');
 
+      // Resolve CURRENT application configuration BEFORE tearing anything
+      // down: a config failure (e.g. missing MINICLOUD_MASTER_KEY for secret
+      // decryption) must leave the existing container untouched.
+      const cfg = await this.resolvedConfig(app.id);
+
       // Tear down any previous container.
       if (row.container_id) {
         await this.docker.stop(row.container_id).catch(() => {});
@@ -402,6 +490,7 @@ export class DeploymentEngine {
 
       const hostPort = await allocatePort(this.config.portRange);
       const containerName = `minicloud-d-${randomUUID().slice(0, 12)}`;
+
       const started = await this.docker.startManagedContainer({
         image: row.image_tag,
         name: containerName,
@@ -409,6 +498,8 @@ export class DeploymentEngine {
         deploymentLabel: deploymentId,
         containerPort: row.container_port ?? this.config.defaults.containerPort,
         hostPort,
+        env: cfg.env,
+        limits: this.dockerLimits(cfg.limits),
       });
       await this.deployments.updateFields(deploymentId, {
         container_id: started.id,
@@ -418,6 +509,9 @@ export class DeploymentEngine {
         failure_reason: null,
         exit_code: null,
         stopped_at: null,
+        // Refresh so the snapshot always describes what this deployment's
+        // container was last started with (restart applies current config).
+        config_snapshot: this.snapshotFor(cfg),
       });
 
       const healthPath = row.health_path ?? this.config.defaults.healthPath;
