@@ -73,6 +73,39 @@ export interface DeploymentDto {
   stoppedAt: string | null;
   url: string | null;
   config: ConfigSnapshotDto | null;
+  autoRestartCount: number;
+  rollbackOf: string | null;
+}
+
+export interface DeploymentEventDto {
+  id: string;
+  type: string;
+  message: string;
+  metadata: Record<string, unknown> | null;
+  createdAt: string;
+}
+
+export interface MetricsDto {
+  deploymentId: string;
+  status: string;
+  restartCount: number;
+  autoRestartCount: number;
+  startedAt: string | null;
+  cpuPercent: number;
+  memoryUsedBytes: number;
+  memoryLimitBytes: number;
+  memoryPercent: number;
+}
+
+export interface RestartPolicyDto {
+  policy: string;
+  maxRestartAttempts: number;
+}
+
+export interface PruneResultDto {
+  containersRemoved: number;
+  imagesRemoved: number;
+  workspacesRemoved: number;
 }
 
 export const api = {
@@ -80,7 +113,8 @@ export const api = {
     request<AppDto>('POST', '/api/apps', { name, repositoryUrl }),
   listApps: () => request<AppDto[]>('GET', '/api/apps'),
   getApp: (id: string) => request<Record<string, unknown>>('GET', `/api/apps/${id}`),
-  deploy: (appId: string) => request<{ deployment: DeploymentDto }>('POST', `/api/apps/${appId}/deploy`, {}),
+  deploy: (appId: string, opts: { ref?: string } = {}) =>
+    request<{ deployment: DeploymentDto }>('POST', `/api/apps/${appId}/deploy`, opts.ref ? { ref: opts.ref } : {}),
   listDeployments: () => request<DeploymentDto[]>('GET', '/api/deployments'),
   getDeployment: (id: string) => request<DeploymentDto>('GET', `/api/deployments/${id}`),
   stop: (id: string) => request<DeploymentDto>('POST', `/api/deployments/${id}/stop`),
@@ -124,6 +158,30 @@ export const api = {
         .catch((err) => reject(err instanceof ApiError ? err : new ApiError(0, String(err))));
     });
   },
+};
+
+// ---- reliability & observability (v0.3) -------------------------------------
+
+export const reliabilityApi = {
+  events: (deploymentId: string) =>
+    request<{ deploymentId: string; events: DeploymentEventDto[] }>(
+      'GET',
+      `/api/deployments/${deploymentId}/events`,
+    ),
+  metrics: (deploymentId: string) =>
+    request<MetricsDto>('GET', `/api/deployments/${deploymentId}/metrics`),
+  rollback: (appId: string, targetDeploymentId: string) =>
+    request<{ deployment: DeploymentDto }>('POST', `/api/apps/${appId}/rollback`, {
+      targetDeploymentId,
+    }),
+  getRestartPolicy: (appId: string) =>
+    request<RestartPolicyDto>('GET', `/api/apps/${appId}/restart-policy`),
+  setRestartPolicy: (appId: string, policy: string, maxRestartAttempts?: number) =>
+    request<RestartPolicyDto>('PUT', `/api/apps/${appId}/restart-policy`, {
+      policy,
+      ...(maxRestartAttempts !== undefined ? { maxRestartAttempts } : {}),
+    }),
+  prune: () => request<PruneResultDto>('POST', '/api/prune'),
 };
 
 // ---- application configuration (env / secrets / limits) --------------------

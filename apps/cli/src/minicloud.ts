@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // minicloud CLI
-import { api, ApiError, configApi, resolveAppId, resolveDeploymentId, assertPlausibleId, type AppDto, type DeploymentDto, type LimitsDto } from './api-client.js';
+import { api, ApiError, configApi, reliabilityApi, resolveAppId, resolveDeploymentId, assertPlausibleId, type AppDto, type DeploymentDto, type LimitsDto } from './api-client.js';
 
 const c = (code: string) => (s: string) => `\x1b[${code}m${s}\x1b[0m`;
 const bold = c('1');
@@ -35,8 +35,16 @@ Usage:
   minicloud delete <deployment-id>       Delete a deployment
   minicloud wait <deployment-id>         Wait for a deployment to finish
 
-Application configuration (applied on next deploy or restart):
-  minicloud env <app>                    List env vars and secret keys
+  minicloud limits clear <app>           Remove limits
+
+Reliability & observability:
+  minicloud events <deployment-id>       Lifecycle event timeline
+  minicloud stats <deployment-id>        Live CPU/memory metrics (--watch to refresh)
+  minicloud rollback <app> <deployment>  Roll back to a previous successful deployment
+  minicloud restart-policy <app> [policy] [--max N]
+                                         Show or set restart policy (disabled|on-failure)
+  minicloud prune [--yes]                Remove stopped containers, unreferenced
+                                         MiniCloud images, stale workspaces
   minicloud env set <app> KEY=VALUE      Create or update an env var
   minicloud env delete <app> KEY         Remove an env var or secret entry
   minicloud secret set <app> KEY [value] Store a secret; value is prompted
@@ -105,7 +113,7 @@ async function cmdDeploy(url: string, opts: { name?: string; ref?: string }): Pr
     app = await api.createApp(repoName, url);
     console.log(`created app ${cyan(app.name)} ${dim(short(app.id))}`);
   }
-  const { deployment } = await api.deploy(app.id);
+  const { deployment } = await api.deploy(app.id, { ref: opts.ref });
   console.log(`deploying ${bold(url)} -> deployment ${dim(short(deployment.id))}`);
   const final = await waitForTerminal(deployment.id);
   if (final.status === 'RUNNING') {
@@ -113,7 +121,7 @@ async function cmdDeploy(url: string, opts: { name?: string; ref?: string }): Pr
   } else {
     console.log(red(`✖ deployment ${final.status}`));
     if (final.failureReason) console.error(`  reason: ${final.failureReason}`);
-    console.log(`  logs: minicloud logs ${final.id}`);
+  const { deployment } = await api.deploy(app.id, { ref: opts.ref });
     process.exit(1);
   }
 }
@@ -221,6 +229,124 @@ function parseLimitFlags(flags: Record<string, string>): { memoryLimitMb?: numbe
     fail('nothing to set: pass --memory <MB> and/or --cpu <CPUS>');
   }
   return out;
+}
+
+// ---- reliability & observability commands -----------------------------------
+
+function formatBytes(bytes: number): string {
+  if (bytes >= 1024 * 1024 * 1024) return `${(bytes / 1024 ** 3).toFixed(2)} GB`;
+  if (bytes >= 1024 * 1024) return `${Math.round(bytes / 1024 / 1024)} MB`;
+  if (bytes >= 1024) return `${Math.round(bytes / 1024)} KB`;
+  return `${bytes} B`;
+}
+
+function formatUptime(startedAt: string | null): string {
+  if (!startedAt) return '—';
+  const seconds = Math.max(0, Math.floor((Date.now() - new Date(startedAt).getTime()) / 1000));
+  const h = Math.floor(seconds / 3600);
+  const m = Math.floor((seconds % 3600) / 60);
+  const s = seconds % 60;
+  if (h > 0) return `${h}h ${m}m`;
+  if (m > 0) return `${m}m ${s}s`;
+  return `${s}s`;
+}
+
+async function cmdEvents(idOrPrefix: string): Promise<void> {
+  const id = await deploymentIdArg(idOrPrefix);
+  const { events } = await reliabilityApi.events(id);
+  if (events.length === 0) return console.log('no events recorded');
+  for (const e of events) {
+    const time = new Date(e.createdAt).toLocaleTimeString();
+    const meta = e.metadata && Object.keys(e.metadata).length > 0 ? dim(` ${JSON.stringify(e.metadata)}`) : '';
+    console.log(`${dim(time)}  ${cyan(e.type.padEnd(24))} ${e.message}${meta}`);
+  }
+}
+
+function printStats(m: {
+  status: string;
+  restartCount: number;
+  autoRestartCount: number;
+  startedAt: string | null;
+  cpuPercent: number;
+  memoryUsedBytes: number;
+  memoryLimitBytes: number;
+  memoryPercent: number;
+}): void {
+  const mem = `${formatBytes(m.memoryUsedBytes)} / ${m.memoryLimitBytes > 0 ? formatBytes(m.memoryLimitBytes) : 'unlimited'}`;
+  console.log(`CPU        ${m.cpuPercent.toFixed(1)}%`);
+  console.log(`Memory     ${mem}${m.memoryLimitBytes > 0 ? ` (${m.memoryPercent.toFixed(1)}%)` : ''}`);
+  console.log(`Uptime     ${formatUptime(m.startedAt)}`);
+  console.log(`Restarts   ${m.restartCount}${m.autoRestartCount > 0 ? ` (${m.autoRestartCount} automatic)` : ''}`);
+  console.log(`Status     ${statusColor(m.status)}`);
+}
+
+async function cmdStats(idOrPrefix: string, watch: boolean): Promise<void> {
+  const id = await deploymentIdArg(idOrPrefix);
+  const render = async (): Promise<void> => {
+    const m = await reliabilityApi.metrics(id);
+    if (watch) process.stdout.write('\x1b[2J\x1b[H');
+    printStats(m);
+  };
+  await render();
+  if (!watch) return;
+  console.log(dim('(watching, Ctrl+C to stop)'));
+  const timer = setInterval(() => void render().catch(() => {}), 2000);
+  const stop = (): void => {
+    clearInterval(timer);
+    process.exit(0);
+  };
+  process.on('SIGINT', stop);
+}
+
+async function cmdRollback(appArg: string, targetArg: string): Promise<void> {
+  if (!appArg || !targetArg) fail('usage: minicloud rollback <app> <deployment-id>');
+  const appId = await requireAppId(appArg);
+  const targetId = await deploymentIdArg(targetArg);
+  const target = await api.getDeployment(targetId);
+  if (target.applicationId !== appId) fail('target deployment belongs to a different application');
+  const { deployment } = await reliabilityApi.rollback(appId, targetId);
+  console.log(`rollback queued: ${short(deployment.id)} (from ${short(targetId)}), waiting…`);
+  const d = await waitForTerminal(deployment.id);
+  if (d.status === 'RUNNING') console.log(green(`✔ rolled back to ${short(targetId)}: ${d.url}`));
+  else {
+    console.log(red(`✖ rollback ended in ${d.status}`));
+    if (d.failureReason) console.error(`  reason: ${d.failureReason}`);
+    process.exit(1);
+  }
+}
+
+async function cmdRestartPolicy(appArg: string, policyArg?: string, maxArg?: string): Promise<void> {
+  const appId = await requireAppId(appArg);
+  if (!policyArg || policyArg === 'show') {
+    const p = await reliabilityApi.getRestartPolicy(appId);
+    console.log(`policy: ${bold(p.policy)}   max restart attempts: ${bold(String(p.maxRestartAttempts))}`);
+    return;
+  }
+  const normalized = policyArg === 'on' ? 'on-failure' : policyArg === 'off' ? 'disabled' : policyArg;
+  if (normalized !== 'on-failure' && normalized !== 'disabled') {
+    fail(`unknown policy "${policyArg}" (use disabled or on-failure)`);
+  }
+  let max: number | undefined;
+  if (maxArg !== undefined) {
+    max = Number(maxArg);
+    if (!Number.isInteger(max) || max < 0 || max > 10) fail('--max must be an integer 0-10');
+  }
+  const p = await reliabilityApi.setRestartPolicy(appId, normalized, max);
+  console.log(`${green('✔')} restart policy: ${bold(p.policy)}, max attempts: ${p.maxRestartAttempts}`);
+}
+
+async function cmdPrune(skipConfirm: boolean): Promise<void> {
+  if (!skipConfirm) {
+    process.stderr.write('Remove stopped MiniCloud containers, unreferenced MiniCloud images and stale workspaces? [y/N] ');
+    const chunks: Buffer[] = [];
+    for await (const chunk of process.stdin) chunks.push(chunk as Buffer);
+    const answer = chunks.join('').trim().toLowerCase();
+    if (answer !== 'y' && answer !== 'yes') return console.log('aborted');
+  }
+  const r = await reliabilityApi.prune();
+  console.log(
+    `${green('✔')} pruned: ${r.containersRemoved} container(s), ${r.imagesRemoved} image(s), ${r.workspacesRemoved} workspace(s)`,
+  );
 }
 
 async function main(): Promise<void> {
@@ -381,6 +507,21 @@ async function main(): Promise<void> {
       }
       return;
     }
+    case 'events':
+      await cmdEvents(positional[0] ?? '');
+      return;
+    case 'stats':
+      await cmdStats(positional[0] ?? '', flags.watch === 'true');
+      return;
+    case 'rollback':
+      await cmdRollback(positional[0] ?? '', positional[1] ?? '');
+      return;
+    case 'restart-policy':
+      await cmdRestartPolicy(positional[0] ?? '', positional[1], flags.max);
+      return;
+    case 'prune':
+      await cmdPrune(flags.yes === 'true');
+      return;
     default:
       help();
       process.exitCode = 1;
