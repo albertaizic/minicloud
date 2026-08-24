@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // minicloud CLI
-import { api, ApiError, resolveDeploymentId, assertPlausibleId, type AppDto, type DeploymentDto } from './api-client.js';
+import { api, ApiError, configApi, resolveAppId, resolveDeploymentId, assertPlausibleId, type AppDto, type DeploymentDto, type LimitsDto } from './api-client.js';
 
 const c = (code: string) => (s: string) => `\x1b[${code}m${s}\x1b[0m`;
 const bold = c('1');
@@ -34,6 +34,20 @@ Usage:
   minicloud restart <deployment-id>      Restart a deployment
   minicloud delete <deployment-id>       Delete a deployment
   minicloud wait <deployment-id>         Wait for a deployment to finish
+
+Application configuration (applied on next deploy or restart):
+  minicloud env <app>                    List env vars and secret keys
+  minicloud env set <app> KEY=VALUE      Create or update an env var
+  minicloud env delete <app> KEY         Remove an env var or secret entry
+  minicloud secret set <app> KEY [value] Store a secret; value is prompted
+                                         hidden or read from stdin if piped.
+                                         Secrets are encrypted at rest and are
+                                         never displayed again.
+  minicloud secret delete <app> KEY      Remove a secret
+  minicloud limits show <app>            Show CPU/memory limits
+  minicloud limits set <app> [--memory MB] [--cpu CPUS]
+                                         Set container resource limits
+  minicloud limits clear <app>           Remove limits
 
 Options for deploy:
   --name <name>       App name (defaults to repo name)
@@ -112,6 +126,101 @@ async function cmdLogs(idOrPrefix: string): Promise<void> {
   await api.streamLogs(fullId, (line) => console.log(line)).catch((err) => fail(err instanceof ApiError ? err.message : String(err)));
   // keep the process alive while the stream is open
   setInterval(() => {}, 1 << 30);
+}
+
+// ---- application configuration commands ------------------------------------
+
+async function requireAppId(raw: string): Promise<string> {
+  if (!raw) fail('missing <app> argument (name, short id or full id)');
+  return resolveAppId(raw);
+}
+
+/**
+ * Secret values are read from an explicit argument only when provided;
+ * otherwise from stdin — hidden prompt on a TTY, piped input otherwise.
+ * Piped values keep trailing whitespace except one final newline.
+ */
+async function readSecretValue(explicit?: string): Promise<string> {
+  if (explicit !== undefined) return explicit;
+  const stdin = process.stdin;
+  if (!stdin.isTTY) {
+    const chunks: Buffer[] = [];
+    for await (const chunk of stdin) chunks.push(chunk as Buffer);
+    const value = chunks.join('').replace(/\r?\n$/, '');
+    if (!value) fail('empty secret on stdin');
+    return value;
+  }
+  process.stderr.write('secret value (input hidden, Enter to confirm): ');
+  stdin.setRawMode(true);
+  stdin.resume();
+  let value = '';
+  await new Promise<void>((resolve) => {
+    const onData = (buf: Buffer): void => {
+      const s = buf.toString('utf8');
+      if (s === '\r' || s === '\n') {
+        stdin.off('data', onData);
+        process.stderr.write('\n');
+        resolve();
+      } else if (s === '\u0003') {
+        // Ctrl+C
+        process.stderr.write('\naborted\n');
+        process.exit(130);
+      } else if (s === '\u007f' || s === '\b') {
+        value = value.slice(0, -1);
+      } else {
+        value += s;
+      }
+    };
+    stdin.on('data', onData);
+  });
+  stdin.setRawMode(false);
+  stdin.pause();
+  if (!value) fail('empty secret value');
+  return value;
+}
+
+async function cmdEnvList(appArg: string): Promise<void> {
+  const cfg = await configApi.listEnv(await requireAppId(appArg));
+  console.log(bold('VARIABLES'));
+  if (cfg.variables.length === 0) console.log(dim('  (none)'));
+  for (const v of cfg.variables) {
+    console.log(`  ${cyan(v.key)}=${v.value} ${dim(v.updatedAt.slice(0, 19))}`);
+  }
+  console.log(bold('SECRETS') + dim('  (values encrypted at rest, never displayed)'));
+  if (cfg.secrets.length === 0) console.log(dim('  (none)'));
+  for (const s of cfg.secrets) {
+    console.log(`  ${yellow(s.key)}=•••••••••• ${dim(s.updatedAt.slice(0, 19))}`);
+  }
+}
+
+async function cmdLimitsShow(appArg: string): Promise<void> {
+  const limits = await configApi.getLimits(await requireAppId(appArg));
+  printLimits(limits);
+}
+
+function printLimits(limits: LimitsDto): void {
+  console.log(
+    `memory: ${limits.memoryLimitMb !== null ? bold(`${limits.memoryLimitMb} MB`) : dim('unlimited')}  ` +
+      `cpu: ${limits.cpuLimit !== null ? bold(String(limits.cpuLimit)) : dim('unlimited')}`,
+  );
+}
+
+function parseLimitFlags(flags: Record<string, string>): { memoryLimitMb?: number; cpuLimit?: number } {
+  const out: { memoryLimitMb?: number; cpuLimit?: number } = {};
+  if (flags.memory !== undefined) {
+    const n = Number(flags.memory);
+    if (!Number.isInteger(n)) fail(`--memory must be an integer number of MB, got "${flags.memory}"`);
+    out.memoryLimitMb = n;
+  }
+  if (flags.cpu !== undefined) {
+    const n = Number(flags.cpu);
+    if (Number.isNaN(n)) fail(`--cpu must be a number of CPUs, got "${flags.cpu}"`);
+    out.cpuLimit = n;
+  }
+  if (out.memoryLimitMb === undefined && out.cpuLimit === undefined) {
+    fail('nothing to set: pass --memory <MB> and/or --cpu <CPUS>');
+  }
+  return out;
 }
 
 async function main(): Promise<void> {
@@ -209,6 +318,67 @@ async function main(): Promise<void> {
       const id = await deploymentIdArg(positional[0] ?? '');
       const d = await waitForTerminal(id);
       console.log(`${d.status}${d.url ? ` ${d.url}` : ''}`);
+      return;
+    }
+    case 'env': {
+      const sub = positional[0];
+      const isListWord = sub === undefined || sub === 'list' || sub === 'ls';
+      if (isListWord) {
+        await cmdEnvList(positional[1] ?? '');
+      } else if (sub === 'set') {
+        const appId = await requireAppId(positional[1] ?? '');
+        const kv = positional[2] ?? '';
+        const eq = kv.indexOf('=');
+        if (eq <= 0) fail('expected KEY=VALUE, e.g.: minicloud env set my-app LOG_LEVEL=debug');
+        await configApi.setEnvVar(appId, kv.slice(0, eq), kv.slice(eq + 1));
+        console.log(`${green('✔')} set ${cyan(kv.slice(0, eq))} (applied on next deploy/restart)`);
+      } else if (sub === 'delete' || sub === 'rm') {
+        const appId = await requireAppId(positional[1] ?? '');
+        const key = positional[2];
+        if (!key) fail('missing KEY argument');
+        await configApi.deleteKey(appId, key);
+        console.log(`${green('✔')} deleted ${key}`);
+      } else {
+        // Not a subcommand: `env <app>` lists that app's configuration.
+        await cmdEnvList(sub);
+      }
+      return;
+    }
+    case 'secret': {
+      const sub = positional[0];
+      if (sub === 'set') {
+        const appId = await requireAppId(positional[1] ?? '');
+        const key = positional[2];
+        if (!key) fail('missing KEY argument, e.g.: minicloud secret set my-app API_TOKEN');
+        const value = await readSecretValue(positional[3]);
+        await configApi.setSecret(appId, key, value);
+        console.log(`${green('✔')} secret ${yellow(key)} stored (encrypted at rest; applied on next deploy/restart)`);
+      } else if (sub === 'delete' || sub === 'rm') {
+        const appId = await requireAppId(positional[1] ?? '');
+        const key = positional[2];
+        if (!key) fail('missing KEY argument');
+        await configApi.deleteSecret(appId, key);
+        console.log(`${green('✔')} secret ${key} deleted`);
+      } else {
+        fail(`unknown secret subcommand "${sub}" (secrets are write-only: use set or delete; "env <app>" lists keys)`);
+      }
+      return;
+    }
+    case 'limits': {
+      const sub = positional[0];
+      if (!sub || sub === 'show') {
+        await cmdLimitsShow(positional[1] ?? '');
+      } else if (sub === 'set') {
+        const appId = await requireAppId(positional[1] ?? '');
+        const limits = parseLimitFlags(flags);
+        printLimits(await configApi.setLimits(appId, limits));
+        console.log(dim('(applied on next deploy/restart)'));
+      } else if (sub === 'clear' || sub === 'delete' || sub === 'rm') {
+        const appId = await requireAppId(positional[1] ?? '');
+        printLimits(await configApi.clearLimits(appId));
+      } else {
+        fail(`unknown limits subcommand "${sub}" (use show, set, clear)`);
+      }
       return;
     }
     default:

@@ -46,6 +46,20 @@ export interface AppDto {
   createdAt: string;
   latestDeployment?: { id: string; status: string; hostPort: number | null; commitSha: string | null } | null;
 }
+
+export interface LimitsDto {
+  memoryLimitMb: number | null;
+  cpuLimit: number | null;
+}
+export interface ConfigSnapshotDto {
+  env: Record<string, string>;
+  secretKeys: string[];
+  limits: { memoryLimitMb?: number; cpuLimit?: number } | null;
+}
+export interface AppConfigDto {
+  variables: { key: string; value: string; updatedAt: string }[];
+  secrets: { key: string; updatedAt: string }[];
+}
 export interface DeploymentDto {
   id: string;
   applicationId: string;
@@ -58,6 +72,7 @@ export interface DeploymentDto {
   startedAt: string | null;
   stoppedAt: string | null;
   url: string | null;
+  config: ConfigSnapshotDto | null;
 }
 
 export const api = {
@@ -109,6 +124,24 @@ export const api = {
         .catch((err) => reject(err instanceof ApiError ? err : new ApiError(0, String(err))));
     });
   },
+};
+
+// ---- application configuration (env / secrets / limits) --------------------
+
+export const configApi = {
+  listEnv: (appId: string) => request<AppConfigDto>('GET', `/api/apps/${appId}/env`),
+  setEnvVar: (appId: string, key: string, value: string) =>
+    request<{ key: string }>('PUT', `/api/apps/${appId}/env/${encodeURIComponent(key)}`, { value }),
+  deleteKey: (appId: string, key: string) =>
+    request<void>('DELETE', `/api/apps/${appId}/env/${encodeURIComponent(key)}`),
+  setSecret: (appId: string, key: string, value: string) =>
+    request<{ key: string }>('PUT', `/api/apps/${appId}/secrets/${encodeURIComponent(key)}`, { value }),
+  deleteSecret: (appId: string, key: string) =>
+    request<void>('DELETE', `/api/apps/${appId}/secrets/${encodeURIComponent(key)}`),
+  getLimits: (appId: string) => request<LimitsDto>('GET', `/api/apps/${appId}/limits`),
+  setLimits: (appId: string, limits: { memoryLimitMb?: number; cpuLimit?: number }) =>
+    request<LimitsDto>('PUT', `/api/apps/${appId}/limits`, limits),
+  clearLimits: (appId: string) => request<LimitsDto>('DELETE', `/api/apps/${appId}/limits`),
 };
 
 // ---- Short-ID resolution ---------------------------------------------------
