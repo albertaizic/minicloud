@@ -54,6 +54,44 @@ export interface StartContainerOptions {
   limits?: ContainerResourceLimits;
 }
 
+export interface ContainerStats {
+  cpuPercent: number;
+  memoryUsedBytes: number;
+  memoryLimitBytes: number;
+  memoryPercent: number;
+}
+
+
+/**
+ * Pure docker-stats parser (unit-testable). CPU% follows the docker CLI
+ * formula; memory usage subtracts cache (cgroup v1) / inactive_file (cgroup
+ * v2) exactly like `docker stats`.
+ */
+export function parseContainerStats(
+  raw: Dockerode.ContainerStats,
+): ContainerStats {
+  const cpuDelta =
+    Number(raw.cpu_stats?.cpu_usage?.total_usage ?? 0) -
+    Number(raw.precpu_stats?.cpu_usage?.total_usage ?? 0);
+  const systemDelta =
+    Number(raw.cpu_stats?.system_cpu_usage ?? 0) -
+    Number(raw.precpu_stats?.system_cpu_usage ?? 0);
+  const onlineCpus =
+    raw.cpu_stats?.online_cpus ?? raw.cpu_stats?.cpu_usage?.percpu_usage?.length ?? 0;
+  const cpuPercent = systemDelta > 0 && cpuDelta > 0 ? (cpuDelta / systemDelta) * onlineCpus * 100 : 0;
+  const m = raw.memory_stats ?? {};
+  const mstats = (m.stats ?? {}) as Record<string, number | undefined>;
+  const cache = mstats.cache ?? mstats.inactive_file ?? 0;
+  const used = Math.max(0, Number(m.usage ?? 0) - Number(cache ?? 0));
+  const limit = Number(m.limit ?? 0);
+  return {
+    cpuPercent: Math.round(cpuPercent * 100) / 100,
+    memoryUsedBytes: used,
+    memoryLimitBytes: limit,
+    memoryPercent: limit > 0 ? Math.round((used / limit) * 10000) / 100 : 0,
+  };
+}
+
 export interface BuildResult {
   imageId: string;
 }
@@ -312,6 +350,42 @@ export class DockerRuntime {
       return true;
     } catch {
       return false;
+    }
+  }
+
+  async stats(id: string): Promise<ContainerStats | null> {
+    let raw: Dockerode.ContainerStats;
+    try {
+      raw = (await this.docker.getContainer(id).stats({ stream: false })) as Dockerode.ContainerStats;
+    } catch (err) {
+      const status = (err as { statusCode?: number }).statusCode;
+      if (status === 404) return null;
+      throw wrapDockerError(err);
+    }
+    return parseContainerStats(raw);
+  }
+
+  /** Remove an image by tag. Returns false when it does not exist. */
+  async removeImage(tag: string): Promise<boolean> {
+    try {
+      await this.docker.getImage(tag).remove();
+      return true;
+    } catch (err) {
+      const status = (err as { statusCode?: number }).statusCode;
+      if (status === 404) return false;
+      throw wrapDockerError(err);
+    }
+  }
+
+  /** All locally stored MiniCloud deployment images (minicloud/app-* tags). */
+  async listMiniCloudImages(): Promise<{ id: string; tags: string[] }[]> {
+    try {
+      const images = await this.docker.listImages({
+        filters: { reference: ['minicloud/app-*'] },
+      });
+      return images.map((i) => ({ id: i.Id, tags: i.RepoTags ?? [] }));
+    } catch (err) {
+      throw wrapDockerError(err);
     }
   }
 }
