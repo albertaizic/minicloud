@@ -1,0 +1,71 @@
+import { useCallback, useEffect, useState } from 'react';
+import { Link, useParams } from 'react-router-dom';
+import { api } from '../api.js';
+import StatusBadge from '../components/StatusBadge.js';
+import LogStream from '../components/LogStream.js';
+
+export default function DeploymentDetail() {
+  const { id } = useParams<{ id: string }>();
+  const [dep, setDep] = useState<Awaited<ReturnType<typeof api.getDeployment>> | null>(null);
+  const [appName, setAppName] = useState('');
+  const [error, setError] = useState('');
+
+  const load = useCallback(() => {
+    if (!id) return;
+    api.getDeployment(id)
+      .then(async (d) => {
+        setDep(d);
+        try {
+          const app = await api.getApp(d.applicationId);
+          setAppName(app.name);
+        } catch { /* app may be gone */ }
+      })
+      .catch((e) => setError(e.message));
+  }, [id]);
+  useEffect(() => {
+    load();
+    const t = setInterval(load, 4000);
+    return () => clearInterval(t);
+  }, [load]);
+
+  if (!dep && !error) return <p>Loading…</p>;
+  if (error) return <p className="error">{error}</p>;
+  if (!dep) return null;
+
+  const act = async (fn: () => Promise<unknown>) => {
+    setError('');
+    try { await fn(); setTimeout(load, 400); } catch (e) { setError((e as Error).message); }
+  };
+
+  return (
+    <div>
+      <p><Link to="/">← Overview</Link>{appName && <> · <Link to={`/apps/${dep.applicationId}`}>{appName}</Link></>}</p>
+      <h1>Deployment <span className="mono">{dep.id.slice(0, 8)}</span></h1>
+      <div className="detail-grid">
+        <div><StatusBadge status={dep.status} /></div>
+        <dl>
+          <dt>Commit</dt><dd className="mono">{dep.commitSha?.slice(0, 12) ?? '—'}</dd>
+          <dt>Ref</dt><dd className="mono">{dep.ref ?? '—'}</dd>
+          <dt>Container</dt><dd className="mono">{dep.containerName ?? '—'}</dd>
+          <dt>URL</dt>
+          <dd>{dep.url
+            ? <a href={dep.url} target="_blank" rel="noreferrer">{dep.url}</a>
+            : <span className="dim">not serving</span>}</dd>
+          <dt>Created</dt><dd>{new Date(dep.createdAt).toLocaleString()}</dd>
+          {dep.startedAt && (<><dt>Started</dt><dd>{new Date(dep.startedAt).toLocaleString()}</dd></>)}
+          {dep.stoppedAt && (<><dt>Stopped</dt><dd>{new Date(dep.stoppedAt).toLocaleString()}</dd></>)}
+          {dep.restartCount > 0 && (<><dt>Restarts</dt><dd>{dep.restartCount}</dd></>)}
+          {dep.exitCode !== null && (<><dt>Exit code</dt><dd className="mono">{dep.exitCode}</dd></>)}
+          {dep.failureReason && (<><dt>Failure</dt><dd className="error-text">{dep.failureReason}</dd></>)}
+        </dl>
+      </div>
+      <div className="actions">
+        <button onClick={() => act(() => api.restart(dep.id))}>Restart</button>
+        <button onClick={() => act(() => api.stop(dep.id))}>Stop</button>
+      </div>
+      {error && <p className="error">{error}</p>}
+      <h2>Logs</h2>
+      <LogStream deploymentId={dep.id} />
+    </div>
+  );
+}

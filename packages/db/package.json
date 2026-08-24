@@ -12,13 +12,15 @@
   "scripts": {
     "typecheck": "tsc --noEmit",
     "test": "echo 'db package: no unit tests (covered by api tests)' && exit 0",
-    "migrate": "node --experimental-strip-types src/migrate-cli.ts"
+    "migrate": "tsx src/migrate-cli.ts"
   },
   "dependencies": {
     "@minicloud/shared": "*",
+    "dotenv": "^16.4.7",
     "pg": "^8.13.1"
   },
   "devDependencies": {
+    "tsx": "^4.19.2",
     "@types/node": "^24.0.0",
     "@types/pg": "^8.11.10",
     "typescript": "^5.6.0"

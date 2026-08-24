@@ -1,7 +1,14 @@
 import { z } from 'zod';
 
+// Public https remotes, ssh remotes, and http(s) remotes on localhost/127.0.0.1
+// (useful for local git servers such as Gitea). Everything else is rejected.
 const REPO_URL_RE =
-  /^(https:\/\/[\w.-]+(:\d+)?\/[\w~%.\-]+\/[\w~%.\-]+(\.git)?\/?|git@[\w.-]+:[\w~%.\-]+\/[\w~%.\-]+(\.git)?)$/;
+  /^(https:\/\/[\w.-]+(:\d+)?\/[\w~%.\-]+(\/[%\w~.\-]+)*(\.git)?\/?|git@[\w.-]+:[\w~%.\-]+\/[\w~%.\-]+(\.git)?)$/;
+const LOCAL_URL_RE = /^https?:\/\/localhost(:\d+)?\/[\w~%.\-]+(\.git)?$/;
+
+function repoUrlAllowed(url: string): boolean {
+  return REPO_URL_RE.test(url) || LOCAL_URL_RE.test(url);
+}
 
 export const createAppSchema = z.object({
   name: z
@@ -10,7 +17,12 @@ export const createAppSchema = z.object({
     .min(1)
     .max(64)
     .regex(/^[a-z0-9][a-z0-9-]*$/i, 'name must be alphanumeric with dashes'),
-  repositoryUrl: z.string().trim().min(1).max(2048).regex(REPO_URL_RE, 'repositoryUrl must be a public https or ssh git URL'),
+  repositoryUrl: z
+    .string()
+    .trim()
+    .min(1)
+    .max(2048)
+    .refine(repoUrlAllowed, 'repositoryUrl must be a public https or ssh git URL (localhost http allowed)'),
 });
 
 export type CreateAppInput = z.infer<typeof createAppSchema>;

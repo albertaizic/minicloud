@@ -1,5 +1,8 @@
 // Minimal migration runner CLI: `npm run migrate -w @minicloud/db`
-import { databaseFromEnv, runMigrations } from './index.js';
+// Load .env from the repo root (two levels up from this package).
+import { config } from 'dotenv';
+config({ path: new URL('../../../.env', import.meta.url) });
+import { databaseFromEnv, runMigrations } from './index.ts';
 
 const db = databaseFromEnv();
 try {

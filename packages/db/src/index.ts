@@ -43,7 +43,7 @@ export class Database {
 }
 
 export function databaseFromEnv(): Database {
-  const url = process.env.DATABASE_URL ?? 'postgres://minicloud:minicloud@localhost:5432/minicloud';
+  const url = process.env.DATABASE_URL ?? 'postgres://minicloud:minicloud@localhost:5433/minicloud';
   const pool = new pg.Pool({ connectionString: url, max: 10 });
   return new Database(pool);
 }
@@ -60,7 +60,7 @@ export async function runMigrations(db: Database): Promise<string[]> {
        applied_at TIMESTAMPTZ NOT NULL DEFAULT now()
      )`,
   );
-  const dir = path.resolve(__dirname, '../../migrations');
+  const dir = path.resolve(__dirname, '../migrations');
   const files = (await readdir(dir)).filter((f) => f.endsWith('.sql')).sort();
   const applied: string[] = [];
   for (const file of files) {
