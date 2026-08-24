@@ -25,6 +25,8 @@ export function isValidGitUrl(url: string): boolean {
   return /^(https:\/\/[^\s]+|git@[^\s]+:[^\s]+)$/.test(url) && !/[\r\n;&|`$<>]/.test(url);
 }
 
+const SHA_RE = /^[0-9a-f]{40}$/i;
+
 export interface ClonedRepo {
   dir: string;
   commitSha: string;
@@ -51,7 +53,7 @@ export async function cloneRepository(
     const baseArgs = [
       'clone',
       '--quiet',
-      ...(ref && ref !== 'HEAD' ? ['--branch', ref] : []),
+      ...(ref && ref !== 'HEAD' && !SHA_RE.test(ref) ? ['--branch', ref] : []),
       '--',
       repoUrl,
       dir,
@@ -64,18 +66,29 @@ export async function cloneRepository(
         maxBuffer: 10 * 1024 * 1024,
         windowsHide: true,
       });
-    try {
-      // Prefer a fast shallow clone; fall back for servers without support
-      // (e.g. dumb http) or refs not advertised.
-      await runClone([...baseArgs.slice(0, 2), '--depth', '1', ...baseArgs.slice(2)]);
-    } catch (shallowErr) {
-      const msg = String((shallowErr as { stderr?: string })?.stderr ?? shallowErr);
-      if (/shallow|smart|dumb/i.test(msg)) {
-        // The failed attempt may have left a partial directory behind.
-        await cleanupDir(dir!);
-        await runClone(baseArgs);
-      } else {
-        throw shallowErr;
+    // A full 40-hex ref is a commit SHA, not a branch: clone without checkout
+    // (full history so ancestor commits are present), then detached-checkout.
+    if (ref && SHA_RE.test(ref)) {
+      await runClone(['clone', '--quiet', '--no-checkout', ...baseArgs.slice(baseArgs.indexOf('--'))]);
+      await execFileAsync('git', ['-C', dir, 'checkout', '--quiet', ref], {
+        cwd: workspaceDir,
+        timeout: 120_000,
+        windowsHide: true,
+      });
+    } else {
+      try {
+        // Prefer a fast shallow clone; fall back for servers without support
+        // (e.g. dumb http) or refs not advertised.
+        await runClone([...baseArgs.slice(0, 2), '--depth', '1', ...baseArgs.slice(2)]);
+      } catch (shallowErr) {
+        const msg = String((shallowErr as { stderr?: string })?.stderr ?? shallowErr);
+        if (/shallow|smart|dumb/i.test(msg)) {
+          // The failed attempt may have left a partial directory behind.
+          await cleanupDir(dir!);
+          await runClone(baseArgs);
+        } else {
+          throw shallowErr;
+        }
       }
     }
     const sha = (await execFileAsync('git', ['-C', dir, 'rev-parse', 'HEAD'])).stdout.trim();
