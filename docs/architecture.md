@@ -104,10 +104,81 @@ last 500 lines client-side).
 
 ### Persistence
 
-Three tables (`applications`, `deployments`, `app_env`) with a CHECK-constrained
-status enum, migrated by `packages/db`'s runner. Ephemeral runtime objects
-(containers, images) are always reconcilable from Docker; durable history lives
-only in PostgreSQL.
+Four tables (`applications`, `deployments`, `app_env`, `deployment_events`) with
+a CHECK-constrained status enum, migrated by `packages/db`'s runner. Ephemeral
+runtime objects (containers, images) are always reconcilable from Docker;
+durable history lives only in PostgreSQL.
+
+### Deployment events (v0.3)
+
+Every lifecycle transition is persisted to `deployment_events` (migration 003):
+`deployment.created`, `clone.*`, `build.*`, `container.*`, `health_check.*`,
+`deployment.running`, `restart.*` (manual + automatic), `container.crashed`,
+`rollback.*`, `stop.requested`, `deployment.stopped/failed/deleted`.
+
+- Ordering is the monotonic `BIGINT identity id` — never timestamps, which can
+  collide within a millisecond. The API returns them oldest-first.
+- Events are written by the engine through a swallow-errors wrapper: a failed
+  event insert logs a warning but never breaks a deployment.
+- Metadata carries structural context only (attempt numbers, image tags, exit
+  codes, ports) — never secret values.
+- Rows cascade-delete with their deployment.
+
+### Automatic restart & recovery (v0.3)
+
+Applications configure a restart policy (`disabled` default, `on-failure`)
+with an attempt budget of 0–10.
+
+```mermaid
+stateDiagram-v2
+    [*] --> RUNNING
+    RUNNING --> FAILED: crash detected<br/>exit code recorded, container removed
+    FAILED --> HEALTH_CHECKING: on-failure + budget left<br/>backoff elapsed (2^N*2s, cap 15s)
+    HEALTH_CHECKING --> RUNNING: health passes<br/>auto_restart_count stays
+    FAILED --> FAILED: budget exhausted<br/>deployment.failed event
+    FAILED --> [*]: manual restart resets budget<br/>manual stop cancels recovery
+```
+
+Design invariants:
+
+- **Timer-free scheduling.** Due restarts live in `deployments.next_auto_restart_at`;
+  the crash monitor tick (crash detection, then due-restart firing) is the only
+  driver. No timers survive deleted deployments, and an API restart cannot lose
+  a pending recovery.
+- **Bounded.** `auto_restart_count` increments per automatic attempt; the budget
+  is checked before scheduling and re-checked before firing. Exhaustion is
+  terminal (`deployment.failed`).
+- **Human actions reset the budget.** Manual restart sets `auto_restart_count=0`
+  and clears any pending recovery; manual stop always cancels it.
+- **Crash handling removes the dead container** (exit code is persisted first),
+  so crashed containers do not accumulate.
+- **Reconciliation reuses the same path**: a RUNNING row whose container died
+  while MiniCloud was offline is treated exactly like a live crash.
+
+### Rollback (v0.3)
+
+`rollback(app, targetDeployment)` creates a NEW deployment referencing the
+target via `rollback_of_deployment_id`:
+
+1. Validation: same application, target has a built image, target is not
+   in-flight.
+2. **Image reuse (fast path)**: if the target's image still exists locally the
+   pipeline walks QUEUED→CLONING→BUILDING (emitting a `build.skipped` event)
+   and starts that image directly.
+3. **Rebuild (fallback)**: otherwise the deployment's ref is set to the
+   target's commit SHA and the pipeline clones and checks out that exact
+   revision.
+4. Configuration is the application's CURRENT config (consistent with restart
+   semantics); the new deployment's snapshot records it. Historical rows and
+   snapshots are never mutated.
+
+### Retention & prune
+
+`minicloud prune` (and startup reconciliation for containers) remove only
+MiniCloud-owned resources: containers whose deployment is gone/terminal,
+`minicloud/app-*` images no deployment references, and `clone-*` workspace
+directories older than an hour. Images referenced by any deployment are kept —
+they are rollback targets.
 
 ### Application configuration (v0.2)
 

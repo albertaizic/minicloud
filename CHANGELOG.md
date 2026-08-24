@@ -5,7 +5,28 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and the project adheres to [Semantic Versioning](https://semver.org).
 
 
-## [Unreleased]
+## [Unreleased] — v0.3 reliability & observability
+
+### Added
+
+- **Deployment event timeline**: every lifecycle transition is persisted to a new `deployment_events` table with monotonic ordering, exposed via `GET /api/deployments/:id/events`, `minicloud events` and a dashboard timeline
+- **Rollback**: `POST /api/apps/:id/rollback`, `minicloud rollback <app> <deployment>` and dashboard rollback buttons with confirmation. Creates a NEW deployment linked via `rollback_of_deployment_id`; reuses the target's image when available, rebuilds from the recorded commit otherwise; historical deployments and snapshots are never mutated
+- **Automatic restart policy**: per-application `disabled`/`on-failure` with a 0–10 attempt budget (`PUT /api/apps/:id/restart-policy`, `minicloud restart-policy`). Timer-free backoff (`min(2^N×2s, 15s)`) stored in the database so recovery survives API restarts; manual stop cancels pending recovery, manual restart/deploy resets the budget; exhaustion is terminal
+- **Runtime metrics**: `GET /api/deployments/:id/metrics` and `minicloud stats` — live CPU %, memory used/limit/%, uptime and restart counts from one-shot Docker stats (docker-CLI-compatible formulas); 409 with explanation instead of fake zeros when unavailable
+- **Prune**: `minicloud prune` / `POST /api/prune` removes only MiniCloud-owned stopped containers, images no deployment references (rollback targets are kept), and `clone-*` workspace dirs older than an hour
+- Startup reconciliation now routes offline crashes through the same policy-aware recovery path as live monitoring
+- Fixtures: `examples/rev-app-{a,b}` (two observable revisions) and `examples/crash-once` (crashes after passing health unless auto-restarted)
+
+### Changed
+
+- Crash detection moved from the API layer into the engine (`engine.checkCrashes()`); crashed containers are now removed after their exit code is recorded
+- Deployment serialization includes `autoRestartCount` and `rollbackOf`; application serialization includes `restartPolicy`/`maxRestartAttempts`
+
+### Security
+
+- Event metadata is restricted to structural context (counters, tags, exit codes, ports) — never secret values; enforced at the single event-writing choke point
+
+## [Unreleased] — v0.2 configuration
 
 ### Added
 

@@ -7,3 +7,4 @@ coverage/
 data/pgdata/
 .vite/
 .serena/
+.minicloud/

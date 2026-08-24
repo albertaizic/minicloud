@@ -51,8 +51,10 @@ solve, at an understandable scale.
   secrets are AES-256-GCM-encrypted at rest and write-only (never returned by
   API, CLI or dashboard)
 - **CPU & memory limits** enforced with Docker cgroups (`--cpus`, hard memory cap)
-- **Deployment configuration snapshots**: each deployment records the effective
-  non-secret config it was started with
+- **Deployment event timeline**: every lifecycle transition is persisted as an ordered event (clone/build/health/restart/crash/rollback) and queryable via API, CLI and dashboard
+- **Rollback**: roll an application back to any previous successful deployment — creates a NEW deployment (history stays immutable), reuses the old image when available, rebuilds from the recorded commit otherwise
+- **Automatic restart policy**: `disabled` or `on-failure` with a bounded attempt budget (0–10) and capped exponential backoff; manual stop/restart resets the budget and suppresses recovery
+- **Runtime metrics**: live CPU %, memory used/limit, uptime and restart counts per deployment via Docker stats
 - **REST API + CLI + web dashboard**
 - **PostgreSQL persistence** with migrations
 
@@ -163,6 +165,21 @@ minicloud limits clear <app>
 
 | Method | Path                     | Description                          |
 |--------|--------------------------|--------------------------------------|
+minicloud limits clear <app>
+
+# reliability & observability (v0.3)
+minicloud events <deployment-id>            # lifecycle event timeline
+minicloud stats <deployment-id> [--watch]   # live CPU/memory/uptime
+minicloud rollback <app> <deployment-id>    # roll back to a previous revision
+minicloud restart-policy <app> [disabled|on-failure] [--max N]
+minicloud prune [--yes]                     # remove stopped containers, unreferenced
+                                            # MiniCloud images, stale workspaces
+```
+
+## API overview
+
+| Method | Path                     | Description                          |
+|--------|--------------------------|--------------------------------------|
 | GET    | `/api/health`            | API + Docker health                  |
 | POST   | `/api/apps`              | Create application                   |
 | GET    | `/api/apps`              | List applications (+ latest deploy)  |
@@ -184,9 +201,16 @@ minicloud limits clear <app>
 | DELETE | `/api/deployments/:id`   | Remove deployment + resources        |
 | GET    | `/api/deployments/:id/logs`    | Recent logs, or SSE stream with `Accept: text/event-stream` |
 
+| GET    | `/api/deployments/:id/events`  | Ordered lifecycle event timeline |
+| GET    | `/api/deployments/:id/metrics` | Live CPU/memory stats (RUNNING only) |
+| POST   | `/api/apps/:id/rollback`       | Roll back to a target deployment (202) |
+| GET    | `/api/apps/:id/restart-policy` | Show restart policy              |
+| PUT    | `/api/apps/:id/restart-policy` | Set policy + attempt budget      |
+| POST   | `/api/prune`                   | Remove unreferenced MiniCloud resources |
+
 Validation errors return `400` with per-field details; impossible operations
 return `409`; unknown ids return `404`.
-Full request/response semantics for configuration endpoints: [docs/api.md](docs/api.md).
+Full request/response semantics: [docs/api.md](docs/api.md).
 
 
 ## Development
@@ -203,22 +227,43 @@ npm run build          # production builds
 ### Testing
 
 - **Unit tests** (state machine, URL validation, port allocation, git URL rules,
-  secret encryption, config schema validation): no services required.
+  secret encryption, config schemas, stats parsing, restart backoff): no
+  services required.
 - **API tests** (`api.test.ts`, `config.test.ts`): require PostgreSQL from
   `docker compose`; cover env/secret/limits CRUD, redaction, and validation.
 - **Integration tests** (`pipeline.integration.test.ts`,
-  `config.integration.test.ts`): require Docker + PostgreSQL; exercise the real
-  clone/build/start/health-check pipeline plus env injection, real cgroup
-  limits (including an OOM-kill case) and redeploy/restart config behavior.
+  `config.integration.test.ts`, `reliability.integration.test.ts`): require
+  Docker + PostgreSQL; exercise the real pipeline, env injection, cgroup
+  limits (incl. OOM), events, rollback (image reuse + rebuild), automatic
+  restart/retry exhaustion, metrics and reconciliation.
 
-## Current limitations (v0.2)
+## Docker resource retention
+
+MiniCloud only ever touches resources it owns (labelled `minicloud.managed`
+containers, `minicloud/app-*` images, `clone-*` workspace dirs):
+
+- **Containers** are removed when a deployment stops, fails a health check,
+  crashes, is restarted, or is deleted. Startup reconciliation and `minicloud
+  prune` remove leftovers.
+- **Images** are kept per deployment — they are rollback targets. `minicloud
+  prune` deletes `minicloud/app-*` images no existing deployment references.
+- **Workspaces**: clone directories are deleted when the pipeline finishes
+  (success or failure); `prune` removes stragglers older than an hour.
+- **Events** live in PostgreSQL, bounded by deployment lifetime (cascade
+  delete). Metrics are live-only; nothing high-frequency is stored.
+
+## Current limitations (v0.3)
 
 - Public repositories only; no credentials, private repos, or monorepo path filters.
 - A root-level `Dockerfile` is required — no buildpack auto-detection yet.
 - Single-host, single-API-instance; the lock map is in-process (DB status guards prevent corruption, but two API instances could both attempt the same build).
 - Logs are streamed/tailed live; there is no long-term log storage or search. An app that prints its own secrets will stream them like any other output — MiniCloud does not redact container stdout.
 - No authentication or multi-user support.
-- No automatic restart policy or rollback (restart uses the same commit's image).
+- Automatic restart covers crashes of RUNNING deployments; a deployment that
+  fails its first health check goes straight to FAILED (deliberate: start
+  failures are usually config/build errors, not transient crashes).
+- Rollback reuses the target's image when present; after an image prune the
+  rebuild path re-clones from the recorded commit (slower but equivalent).
 - Health checks accept any HTTP response as "healthy" (even 500).
 - Secrets live in one Postgres column encrypted with one master key: rotating
   `MINICLOUD_MASTER_KEY` requires re-entering secrets; losing it makes stored
@@ -226,11 +271,11 @@ npm run build          # production builds
 
 ## Roadmap
 
-1. Bounded automatic restart with backoff
-2. Build log streaming polish + deployment event timeline
-3. Rollback to a previous successful deployment
-4. Multi-repo subdirectory builds & buildpacks
-5. Secret key rotation support (`MINICLOUD_MASTER_KEY_{NEW,OLD}` re-encryption)
+1. Secret key rotation support (`MINICLOUD_MASTER_KEY_{NEW,OLD}` re-encryption)
+2. Multi-repo subdirectory builds & buildpacks
+3. Bounded recent-metrics history for the dashboard
+4. Deployment annotations and user-triggered events
+
 
 ## Security model
 
@@ -239,7 +284,7 @@ a single-user local development tool — not a hardened multi-tenant sandbox.
 See [docs/security.md](docs/security.md) for details on secret handling,
 threat model, and operator responsibilities.
 
-What v0.2 does:
+What v0.3 does:
 
 - Git URLs are strictly validated (https/ssh forms plus localhost http); shell
   metacharacters are rejected and git runs via argument-array `execFile`.
@@ -256,7 +301,7 @@ What v0.2 does:
 - Optional per-app CPU/memory limits give operators a lever against runaway
   containers.
 
-What v0.2 does **not** do:
+What v0.3 does **not** do:
 
 - Built images execute arbitrary code from the repository during build *and* runtime — by design, but that means full host-level isolation must come from Docker itself, not MiniCloud.
 - The API has no authentication: anyone who can reach port 4000 can deploy anything Docker can do (and read plain env vars).

@@ -89,6 +89,28 @@ MiniCloud is a **single-user, local development PaaS**. We assume:
 - Verified against real containers in `config.integration.test.ts`, including
   a functional OOM case (exit code 137).
 
+
+## Events, metrics and rollback (v0.3)
+
+- **Events never carry secret values.** Event metadata is structural only
+  (attempt counters, image tags, exit codes, ports). The engine's event helper
+  documents this rule at the only choke point where events are written.
+- Event history is scoped per deployment and cascades away with it; the events
+  endpoint requires a valid deployment id and exposes nothing cross-app.
+- **Metrics** are read live from Docker stats per request; nothing is stored,
+  so there is no historical metric data to leak. Memory figures come from the
+  container's own cgroup — an app can observe the same numbers.
+- **Rollback** never mutates historical deployments: it creates a new row that
+  references the target. Rollback targets must belong to the same application
+  and have a built image; the API maps rule violations to 404/409 instead of
+  leaking engine internals.
+- **Prune** operates exclusively on MiniCloud-labelled containers,
+  `minicloud/app-*` images and `clone-*` workspace directories. It cannot touch
+  unrelated Docker resources, and images referenced by any deployment are
+  preserved as rollback targets.
+- `MINICLOUD_RESTART_ATTEMPT` (injected into automatic-restart containers) is a
+  counter, not secret material.
+
 ## Input validation summary
 
 | Input | Rule |
@@ -97,6 +119,7 @@ MiniCloud is a **single-user, local development PaaS**. We assume:
 | Env/secret value | ≤ 8192 chars |
 | `memoryLimitMb` | integer 16–65536 |
 | `cpuLimit` | number 0.1–64 |
+| Restart policy | `disabled` or `on-failure`; attempts integer 0–10 |
 | Cross-kind overwrite | rejected `409` (delete first) |
 | Unknown payload fields | rejected (`strict()` schemas) |
 | IDs in URLs | UUID-validated before DB access |

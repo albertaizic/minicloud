@@ -1,11 +1,105 @@
-# API & CLI reference (v0.2)
+# API & CLI reference (v0.3)
 
 Base URL: `http://localhost:4000` (`PORT` / `HOST` in `.env`).
 All bodies are JSON; validation failures return `400` with
 `{"error": "...", "details": {field: [messages]}}`.
 
-This page documents the v0.2 configuration endpoints and CLI commands. For the
-core deployment endpoints see the [README](../README.md#api-overview).
+This page documents the configuration (v0.2) and reliability/observability
+(v0.3) endpoints and CLI commands. For the core deployment endpoints see the
+[README](../README.md#api-overview).
+
+## Deployment events
+
+Every deployment keeps a persistent, ordered lifecycle history.
+
+```
+GET /api/deployments/:id/events
+200 {
+  "deploymentId": "...",
+  "events": [
+    { "id": "42", "type": "clone.started", "message": "main",
+      "metadata": null, "createdAt": "..." },
+    { "id": "43", "type": "build.completed", "message": "minicloud/app-...:d-...",
+      "metadata": { "imageTag": "..." }, "createdAt": "..." }
+  ]
+}
+404 unknown deployment | 400 malformed id
+```
+
+Event types: `deployment.created`, `clone.started/completed`, `build.started/
+completed/skipped`, `container.starting/started/crashed`, `health_check.started/
+passed`, `deployment.running/stopped/failed/deleted`, `restart.requested/
+attempt/succeeded/failed`, `restart.auto_scheduled/auto_attempt/auto_succeeded/
+auto_failed`, `rollback.requested`, `stop.requested`.
+
+Ordering is a monotonic sequence (`id`), not a timestamp. Metadata is
+structural context only and never contains secret values.
+
+## Runtime metrics
+
+```
+GET /api/deployments/:id/metrics
+200 {
+  "deploymentId": "...", "status": "RUNNING",
+  "restartCount": 1, "autoRestartCount": 1, "startedAt": "...",
+  "cpuPercent": 3.2,
+  "memoryUsedBytes": 88064, "memoryLimitBytes": 134217728, "memoryPercent": 0.07
+}
+409 deployment is not RUNNING (or stats temporarily unavailable)
+404 unknown deployment
+```
+
+Live one-shot Docker stats — CPU% uses docker's own formula, memory subtracts
+cache/inactive_file exactly like `docker stats`. No metrics history is stored.
+
+## Rollback
+
+```
+POST /api/apps/:id/rollback    body: {"targetDeploymentId": "..."}
+202 { "deployment": { ...new deployment... }, "message": "Rollback queued" }
+404 target does not exist
+409 target belongs to another application | target has no built image |
+    target is still in progress | target image gone and commit unknown
+400 malformed ids / body
+```
+
+Semantics:
+
+- Creates a **new** deployment; historical deployments and their snapshots are
+  never modified. The new deployment carries `rollbackOf: <target id>`.
+- Reuses the target's Docker image when it still exists (fast path, event
+  `build.skipped`); otherwise rebuilds from the target's recorded commit.
+- Runs the normal health check; failures mark the new deployment FAILED and
+  leave everything else untouched.
+
+## Restart policy
+
+```
+GET /api/apps/:id/restart-policy
+200 {"policy": "disabled", "maxRestartAttempts": 3}
+
+PUT /api/apps/:id/restart-policy
+    body: {"policy": "disabled" | "on-failure", "maxRestartAttempts"?: 0-10}
+200 updated policy
+400 invalid policy or attempt count
+```
+
+Behavior: a RUNNING deployment whose container dies is marked FAILED (exit code
+recorded, dead container removed). With `on-failure` and budget remaining, an
+automatic restart is scheduled with backoff `min(2^attempt × 2s, 15s)`. Manual
+stop cancels pending recovery; manual restart/deploy resets the budget.
+Exhaustion is terminal. Stopped or deleted deployments never restart.
+
+## Prune
+
+```
+POST /api/prune
+200 {"containersRemoved": N, "imagesRemoved": N, "workspacesRemoved": N}
+```
+
+Removes only MiniCloud-owned resources: containers of gone/terminal
+deployments, `minicloud/app-*` images referenced by no deployment, and
+`clone-*` workspace directories older than one hour.
 
 ## Application configuration
 
@@ -133,14 +227,33 @@ minicloud restart <deployment-id>            # picks up new config without rebui
 Exit codes: `0` success, `1` on errors reported by the API or local validation,
 `130` when a secret prompt is aborted with Ctrl+C.
 
+## Reliability & observability CLI (v0.3)
+
+```
+minicloud events <deployment-id>            chronological lifecycle timeline
+minicloud stats <deployment-id> [--watch]   CPU/memory/uptime/restarts snapshot
+                                            (--watch refreshes every 2s, Ctrl+C stops)
+minicloud rollback <app> <deployment-id>    queue a rollback and wait for it
+minicloud restart-policy <app>              show current policy
+minicloud restart-policy <app> <disabled|on-failure> [--max N]
+minicloud prune [--yes]                     clean unreferenced MiniCloud resources
+```
+
+All deployment-id arguments accept unambiguous short prefixes, as everywhere
+else in the CLI. `rollback` prints the outcome and exits non-zero if the new
+deployment ends in FAILED.
+
 ## Dashboard
 
-The application page has a **Configuration** section:
+The application page has:
 
-- Environment variables table with add/update/delete.
-- Secrets table showing masked values (`••••••••`) with replace/delete; typed
-  values use a password input and are never rendered back.
-- Resource limit form (memory MB / CPUs) with save and clear.
+- a **Restart policy** editor (policy + attempt budget),
+- a **Configuration** section: env var table with add/update/delete, write-only
+  secrets (masked values, password input), resource limits form,
+- the deployment history with **Rollback** buttons (inline confirmation) on
+  every deployment that has a built image, and a `↩` marker on rollbacks.
 
-Deployment pages show the recorded snapshot: plain values, masked secret rows,
-and the effective limits.
+The deployment page shows status/URL/commit/rollback origin, live **metrics**
+(CPU, memory, uptime, restarts — polled every 3s only while RUNNING, timers
+cleaned up on navigation), the **event timeline**, the configuration snapshot,
+and logs.
