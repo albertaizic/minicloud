@@ -63,8 +63,41 @@ export default function DeploymentDetail() {
         <button onClick={() => act(() => api.restart(dep.id))}>Restart</button>
         <button onClick={() => act(() => api.stop(dep.id))}>Stop</button>
       </div>
-      {error && <p className="error">{error}</p>}
-      <h2>Logs</h2>
+      {dep.config && (
+        <>
+          <h2>Configuration used by this deployment</h2>
+          <p className="dim">
+            Snapshot of the effective non-secret configuration captured when the
+            container was (re)started. Secret values are never recorded.
+          </p>
+          <table className="table">
+            <thead>
+              <tr><th>Variable</th><th>Value</th></tr>
+            </thead>
+            <tbody>
+              {Object.entries(dep.config.env).map(([k, v]) => (
+                <tr key={k}>
+                  <td className="mono">{k}</td>
+                  <td className="mono">{v}</td>
+                </tr>
+              ))}
+              {dep.config.secretKeys.map((k) => (
+                <tr key={k}>
+                  <td className="mono">{k}</td>
+                  <td className="mono dim">•••••••• (secret)</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+          <p className="dim">
+            Resource limits:{' '}
+            {dep.config.limits
+              ? `${dep.config.limits.memoryLimitMb ?? '—'} MB memory, ${dep.config.limits.cpuLimit ?? '—'} CPUs`
+              : 'none'}
+          </p>
+        </>
+      )}
+       <h2>Logs</h2>
       <LogStream deploymentId={dep.id} />
     </div>
   );

@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from 'react';
 import { Link, useParams } from 'react-router-dom';
 import { api } from '../api.js';
+import ConfigPanel from '../components/ConfigPanel.js';
 import StatusBadge from '../components/StatusBadge.js';
 
 export default function AppDetail() {
@@ -51,7 +52,8 @@ export default function AppDetail() {
           </>
         )}
       </div>
-      {error && <p className="error">{error}</p>}
+      <h2>Configuration</h2>
+      <ConfigPanel appId={data.id} />
       <h2>Deployments</h2>
       <table className="table">
         <thead>

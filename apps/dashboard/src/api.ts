@@ -15,6 +15,22 @@ export interface AppDto {
   } | null;
 }
 
+export interface LimitsDto {
+  memoryLimitMb: number | null;
+  cpuLimit: number | null;
+}
+
+export interface ConfigSnapshotDto {
+  env: Record<string, string>;
+  secretKeys: string[];
+  limits: { memoryLimitMb?: number; cpuLimit?: number } | null;
+}
+
+export interface AppConfigDto {
+  variables: { key: string; value: string; updatedAt: string }[];
+  secrets: { key: string; updatedAt: string }[];
+}
+
 export interface DeploymentDto {
   id: string;
   applicationId: string;
@@ -28,6 +44,7 @@ export interface DeploymentDto {
   failureReason: string | null;
   exitCode: number | null;
   restartCount: number;
+  config: ConfigSnapshotDto | null;
   createdAt: string;
   startedAt: string | null;
   stoppedAt: string | null;
@@ -54,4 +71,26 @@ export const api = {
   getDeployment: (id: string) => req<DeploymentDto>(`/api/deployments/${id}`),
   stop: (id: string) => req<DeploymentDto>(`/api/deployments/${id}/stop`, { method: 'POST' }),
   restart: (id: string) => req<DeploymentDto>(`/api/deployments/${id}/restart`, { method: 'POST' }),
+};
+
+export const configApi = {
+  listEnv: (appId: string) => req<AppConfigDto>(`/api/apps/${appId}/env`),
+  setEnvVar: (appId: string, key: string, value: string) =>
+    req<{ key: string }>(`/api/apps/${appId}/env/${encodeURIComponent(key)}`, {
+      method: 'PUT',
+      body: JSON.stringify({ value }),
+    }),
+  deleteEnvKey: (appId: string, key: string) =>
+    req<void>(`/api/apps/${appId}/env/${encodeURIComponent(key)}`, { method: 'DELETE' }),
+  setSecret: (appId: string, key: string, value: string) =>
+    req<{ key: string }>(`/api/apps/${appId}/secrets/${encodeURIComponent(key)}`, {
+      method: 'PUT',
+      body: JSON.stringify({ value }),
+    }),
+  deleteSecret: (appId: string, key: string) =>
+    req<void>(`/api/apps/${appId}/secrets/${encodeURIComponent(key)}`, { method: 'DELETE' }),
+  getLimits: (appId: string) => req<LimitsDto>(`/api/apps/${appId}/limits`),
+  setLimits: (appId: string, limits: { memoryLimitMb?: number; cpuLimit?: number }) =>
+    req<LimitsDto>(`/api/apps/${appId}/limits`, { method: 'PUT', body: JSON.stringify(limits) }),
+  clearLimits: (appId: string) => req<LimitsDto>(`/api/apps/${appId}/limits`, { method: 'DELETE' }),
 };
