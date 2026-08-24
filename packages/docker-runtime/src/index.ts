@@ -36,6 +36,13 @@ function wrapDockerError(err: unknown): Error {
   return err instanceof Error ? err : new Error(String(err));
 }
 
+export interface ContainerResourceLimits {
+  /** Docker memory limit in bytes. */
+  memoryBytes?: number;
+  /** CPU quota as fractional CPUs (Docker --cpus equivalent). */
+  cpus?: number;
+}
+
 export interface StartContainerOptions {
   image: string;
   name: string;
@@ -44,6 +51,7 @@ export interface StartContainerOptions {
   containerPort: number;
   hostPort: number;
   env?: Record<string, string>;
+  limits?: ContainerResourceLimits;
 }
 
 export interface BuildResult {
@@ -124,6 +132,13 @@ export class DockerRuntime {
           PortBindings: {
             [`${o.containerPort}/tcp`]: [{ HostPort: String(o.hostPort) }],
           },
+          // Resource limits (cgroups). Memory is in bytes; MemorySwap == Memory
+          // disables swap so the cap is hard (default would allow 2x in swap).
+          // NanoCpus encodes --cpus as CPUs * 1e9. Omitted entirely when unset.
+          ...(o.limits?.memoryBytes
+            ? { Memory: o.limits.memoryBytes, MemorySwap: o.limits.memoryBytes }
+            : {}),
+          ...(o.limits?.cpus ? { NanoCpus: Math.round(o.limits.cpus * 1e9) } : {}),
           Privileged: false,
           RestartPolicy: { Name: 'no' },
           // Deliberately no Binds: user containers never receive host mounts.
@@ -168,6 +183,34 @@ export class DockerRuntime {
     } catch (err) {
       const status = (err as { statusCode?: number }).statusCode;
       if (status === 404) return null; // container removed / never existed
+      throw wrapDockerError(err);
+    }
+  }
+
+  /** Raw subset of `docker inspect` needed by tests and diagnostics. */
+  async inspectContainer(id: string): Promise<{
+    env: string[];
+    state: { running: boolean; exitCode: number | null; oomKilled: boolean };
+    limits: { memoryBytes: number | null; memorySwapBytes: number | null; nanoCpus: number | null };
+  } | null> {
+    try {
+      const info = await this.docker.getContainer(id).inspect();
+      return {
+        env: info.Config?.Env ?? [],
+        state: {
+          running: info.State.Running,
+          exitCode: info.State.Running ? null : (info.State.ExitCode ?? null),
+          oomKilled: Boolean(info.State.OOMKilled),
+        },
+        limits: {
+          memoryBytes: info.HostConfig?.Memory ?? null,
+          memorySwapBytes: info.HostConfig?.MemorySwap ?? null,
+          nanoCpus: info.HostConfig?.NanoCpus ?? null,
+        },
+      };
+    } catch (err) {
+      const status = (err as { statusCode?: number }).statusCode;
+      if (status === 404) return null;
       throw wrapDockerError(err);
     }
   }
