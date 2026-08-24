@@ -310,7 +310,41 @@ export async function buildApp(opts: BuildAppOptions): Promise<FastifyInstance> 
     });
   });
 
+  // Crash monitor: detect RUNNING containers that exit unexpectedly.
+  const monitorInterval = Number(process.env.CRASH_MONITOR_INTERVAL_MS ?? 5000);
+  const monitor = setInterval(() => {
+    void checkCrashes().catch((err) => {
+      app.log.error({ err }, 'crash monitor error');
+    });
+  }, monitorInterval);
+  monitor.unref();
+
+  async function checkCrashes(): Promise<void> {
+    const rows = await db.query<{ id: string; container_id: string | null; status: string }>(
+      `SELECT d.id, d.container_id, d.status
+       FROM deployments d
+       WHERE d.status IN ('RUNNING')`,
+    );
+    for (const row of rows.rows) {
+      if (!row.container_id) continue;
+      const state = await docker.getContainerState(row.container_id).catch(() => null);
+      if (state === null || !state.running) {
+        await db.query(
+          `UPDATE deployments SET status='FAILED', failure_reason=$2, exit_code=$3, stopped_at=now()
+           WHERE id=$1 AND status='RUNNING'`,
+          [
+            row.id,
+            state === null ? 'Container disappeared unexpectedly' : 'Container exited unexpectedly',
+            state?.exitCode ?? null,
+          ],
+        );
+        app.log.warn({ deploymentId: row.id, exitCode: state?.exitCode }, 'container crashed');
+      }
+    }
+  }
+
   app.addHook('onClose', async () => {
+    clearInterval(monitor);
     logListeners.clear();
   });
 

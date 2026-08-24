@@ -32,39 +32,6 @@ async function main(): Promise<void> {
     logger.error('startup reconciliation failed', { error: String(err) });
   }
 
-  // Crash monitor: detect RUNNING containers that exit unexpectedly.
-  const monitorInterval = Number(process.env.CRASH_MONITOR_INTERVAL_MS ?? 5000);
-  const monitor = setInterval(() => {
-    void checkCrashes().catch((err) => logger.error('crash monitor error', { error: String(err) }));
-  }, monitorInterval);
-  monitor.unref();
-
-  async function checkCrashes(): Promise<void> {
-    const rows = await db.query<{ id: string; container_id: string | null; host_port: number | null; status: string; name: string }>(
-      `SELECT d.id, d.container_id, d.host_port, d.status, a.name
-       FROM deployments d JOIN applications a ON a.id = d.application_id
-       WHERE d.status IN ('RUNNING')`,
-    );
-    for (const row of rows.rows) {
-      if (!row.container_id) continue;
-      const state = await docker.getContainerState(row.container_id).catch(() => null);
-      if (state === null || !state.running) {
-        await db.query(
-          `UPDATE deployments SET status='FAILED', failure_reason=$2, exit_code=$3, stopped_at=now()
-           WHERE id=$1 AND status='RUNNING'`,
-          [
-            row.id,
-            state === null
-              ? `Container disappeared unexpectedly`
-              : `Container exited unexpectedly`,
-            state?.exitCode ?? null,
-          ],
-        );
-        logger.error('container crashed', { deploymentId: row.id, app: row.name, exitCode: state?.exitCode });
-      }
-    }
-  }
-
   const port = Number(process.env.PORT ?? 4000);
   const host = process.env.HOST ?? '0.0.0.0';
   await app.listen({ port, host });
@@ -72,7 +39,6 @@ async function main(): Promise<void> {
 
   const shutdown = async (signal: string) => {
     logger.info('shutting down', { signal });
-    clearInterval(monitor);
     await app.close().catch(() => {});
     await db.close().catch(() => {});
     process.exit(0);
