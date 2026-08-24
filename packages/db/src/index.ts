@@ -83,7 +83,10 @@ export interface ApplicationRow {
   created_at: Date;
   memory_limit_mb?: number | null;
   cpu_limit?: number | null;
+  restart_policy: string;
+  max_restart_attempts: number;
 }
+
 export interface DeploymentRow {
   id: string;
   application_id: string;
@@ -100,6 +103,9 @@ export interface DeploymentRow {
   exit_code: number | null;
   restart_count: number;
   config_snapshot: Record<string, unknown> | null;
+  rollback_of_deployment_id: string | null;
+  auto_restart_count: number;
+  next_auto_restart_at: Date | null;
   created_at: Date;
   started_at: Date | null;
   stopped_at: Date | null;
@@ -116,11 +122,23 @@ export class AppRepository {
     return res.rows[0]!;
   }
 
+
   async list(): Promise<ApplicationRow[]> {
     const res = await this.db.query<ApplicationRow>('SELECT * FROM applications ORDER BY created_at DESC');
     return res.rows;
   }
 
+  /** Update only the restart-policy columns; limits are managed separately. */
+  async setRestartPolicy(
+    applicationId: string,
+    policy: string,
+    maxRestartAttempts: number,
+  ): Promise<void> {
+    await this.db.query(
+      'UPDATE applications SET restart_policy = $2, max_restart_attempts = $3 WHERE id = $1',
+      [applicationId, policy, maxRestartAttempts],
+    );
+  }
   async byId(id: string): Promise<ApplicationRow | null> {
     const res = await this.db.query<ApplicationRow>('SELECT * FROM applications WHERE id = $1', [id]);
     return res.rows[0] ?? null;
@@ -140,11 +158,27 @@ export class AppRepository {
 export class DeploymentRepository {
   constructor(private readonly db: Database) {}
 
-  async create(applicationId: string, opts: { ref?: string; healthPath?: string; containerPort?: number }): Promise<DeploymentRow> {
+  async create(
+    applicationId: string,
+    opts: {
+      ref?: string;
+      healthPath?: string;
+      containerPort?: number;
+      commitSha?: string | null;
+      rollbackOf?: string | null;
+    } = {},
+  ): Promise<DeploymentRow> {
     const res = await this.db.query<DeploymentRow>(
-      `INSERT INTO deployments (application_id, ref, health_path, container_port, status)
-       VALUES ($1, $2, $3, $4, 'QUEUED') RETURNING *`,
-      [applicationId, opts.ref ?? 'HEAD', opts.healthPath ?? null, opts.containerPort ?? null],
+      `INSERT INTO deployments (application_id, ref, health_path, container_port, commit_sha, rollback_of_deployment_id, status)
+       VALUES ($1, $2, $3, $4, $5, $6, 'QUEUED') RETURNING *`,
+      [
+        applicationId,
+        opts.ref ?? 'HEAD',
+        opts.healthPath ?? null,
+        opts.containerPort ?? null,
+        opts.commitSha ?? null,
+        opts.rollbackOf ?? null,
+      ],
     );
     return res.rows[0]!;
   }
@@ -222,9 +256,12 @@ export class DeploymentRepository {
       host_port: number | null;
       container_port: number | null;
       health_path: string | null;
+
       failure_reason: string | null;
       exit_code: number | null;
       restart_count: number;
+      auto_restart_count: number;
+      next_auto_restart_at: Date | null;
       config_snapshot: Record<string, unknown> | null;
       started_at: Date | null;
       stopped_at: Date | null;
@@ -235,6 +272,24 @@ export class DeploymentRepository {
     const sets = keys.map((k, i) => `${k} = $${i + 2}`);
     const values = keys.map((k) => fields[k as keyof typeof fields]);
     await this.db.query(`UPDATE deployments SET ${sets.join(', ')} WHERE id = $1`, [id, ...values]);
+  }
+
+  /**
+   * Atomically claim a due automatic restart: increments the attempt counter
+   * and clears the marker only if the deployment is still FAILED with a due
+   * marker. Returns the updated row, or null when a concurrent operation
+   * (manual stop/restart/delete) won the race.
+   */
+  async claimDueAutoRestart(id: string): Promise<DeploymentRow | null> {
+    const res = await this.db.query<DeploymentRow>(
+      `UPDATE deployments
+       SET auto_restart_count = auto_restart_count + 1, next_auto_restart_at = NULL
+       WHERE id = $1 AND status = 'FAILED'
+         AND next_auto_restart_at IS NOT NULL AND next_auto_restart_at <= now()
+       RETURNING *`,
+      [id],
+    );
+    return res.rows[0] ?? null;
   }
 
   async latestForApp(applicationId: string): Promise<DeploymentRow | null> {
@@ -391,5 +446,71 @@ export class AppConfigRepository {
       'UPDATE applications SET memory_limit_mb = NULL, cpu_limit = NULL WHERE id = $1',
       [applicationId],
     );
+  }
+}
+
+export interface DeploymentEventRow {
+  id: string;
+  deployment_id: string;
+  event_type: string;
+  message: string;
+  metadata: Record<string, unknown> | null;
+  created_at: Date;
+}
+
+/**
+ * Persistent, ordered lifecycle event history for deployments. Ordering is the
+ * monotonic BIGINT `id` (see migration 003) — never timestamps. Metadata is for
+ * structural context only (attempt numbers, image tags, exit codes); secret
+ * values must never be passed here.
+ */
+export class DeploymentEventRepository {
+  constructor(private readonly db: Database) {}
+
+  async append(
+    deploymentId: string,
+    eventType: string,
+    message = '',
+    metadata?: Record<string, unknown>,
+  ): Promise<void> {
+    await this.db.query(
+      `INSERT INTO deployment_events (deployment_id, event_type, message, metadata)
+       VALUES ($1, $2, $3, $4)`,
+      [deploymentId, eventType, message, metadata ?? null],
+    );
+  }
+
+  async appendMany(
+    deploymentId: string,
+    events: Array<{ type: string; message?: string; metadata?: Record<string, unknown> }>,
+  ): Promise<void> {
+    if (events.length === 0) return;
+    await this.db.tx(async (q) => {
+      for (const e of events) {
+        await q.query(
+          `INSERT INTO deployment_events (deployment_id, event_type, message, metadata)
+           VALUES ($1, $2, $3, $4)`,
+          [deploymentId, e.type, e.message ?? '', e.metadata ?? null],
+        );
+      }
+    });
+  }
+
+  /** Chronological history for one deployment (oldest first). */
+  async listByDeployment(deploymentId: string, limit = 500): Promise<DeploymentEventRow[]> {
+    const res = await this.db.query<DeploymentEventRow>(
+      `SELECT * FROM deployment_events WHERE deployment_id = $1 ORDER BY id ASC LIMIT $2`,
+      [deploymentId, limit],
+    );
+    return res.rows;
+  }
+
+  /** Count of events per deployment — used by retention checks in tests. */
+  async countForDeployment(deploymentId: string): Promise<number> {
+    const res = await this.db.query<{ count: string }>(
+      'SELECT COUNT(*)::text AS count FROM deployment_events WHERE deployment_id = $1',
+      [deploymentId],
+    );
+    return Number(res.rows[0]?.count ?? 0);
   }
 }
