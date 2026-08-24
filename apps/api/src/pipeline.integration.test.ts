@@ -3,83 +3,24 @@
  * Requires: Docker running and PostgreSQL via `docker compose up -d postgres`.
  * Run with: npm run test:integration -w @minicloud/api
  *
- * These tests clone from a local git URL. To make the examples clonable, the
- * test bootstraps bare repos from ../examples into a temp dir served over
- * dumb-HTTP by Node's http server.
+ * These tests clone from a local git URL. The shared fixture server publishes
+ * the example fixtures as bare repos over dumb HTTP (see fixture-server.ts).
  */
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
-import http from 'node:http';
-import path from 'node:path';
-import os from 'node:os';
-import { execFile } from 'node:child_process';
-import { promisify } from 'node:util';
-import fsp from 'node:fs/promises';
 import { createTestApp, destroyTestContext, type TestContext } from './test-helpers.js';
-
-const run = promisify(execFile);
+import { startFixtureServer, type FixtureServer } from './fixture-server.js';
 
 let ctx: TestContext;
-let server: http.Server;
-let port = 0;
-const gitRoot = path.join(os.tmpdir(), `minicloud-it-git-${Date.now()}`);
-
-async function sh(cmd: string, args: string[], cwd?: string): Promise<void> {
-  await run(cmd, args, cwd ? { cwd } : undefined);
-}
+let fixtures: FixtureServer;
 
 beforeAll(async () => {
   ctx = await createTestApp();
-
-  // Build bare repos for the fixtures and serve them statically (dumb HTTP).
-  const repoRoot = path.resolve(import.meta.dirname ?? '.', '../../../examples');
-  await fsp.mkdir(gitRoot, { recursive: true });
-  for (const name of ['hello-node', 'failing-app']) {
-    const bare = path.join(gitRoot, `${name}.git`);
-    await sh('git', ['init', '--bare', '-q', bare]);
-    const work = path.join(gitRoot, `work-${name}`);
-    await sh('git', ['clone', '-q', bare, work]);
-    // copy fixture files
-    const files = await fsp.readdir(path.join(repoRoot, name));
-    for (const f of files) {
-      await fsp.copyFile(path.join(repoRoot, name, f), path.join(work, f));
-    }
-    await sh('git', ['add', '-A'], work);
-    await sh('git', ['-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-qm', 'fixture'], work);
-    await sh('git', ['push', '-q'], work);
-    await sh('git', ['update-server-info'], bare);
-  }
-  const rootHandler: http.RequestListener = (req, res) => {
-    // Minimal static file serving of the git dir tree.
-    const urlPath = decodeURIComponent((req.url ?? '/').split('?')[0]!);
-    const filePath = path.join(gitRoot, urlPath);
-    if (!filePath.startsWith(gitRoot)) {
-      res.writeHead(403);
-      res.end();
-      return;
-    }
-    void fsp.readFile(filePath)
-      .then((data) => {
-        res.writeHead(200, { 'content-type': 'application/octet-stream' });
-        res.end(data);
-      })
-      .catch(() => {
-        res.writeHead(404);
-        res.end();
-      });
-  };
-  await new Promise<void>((resolve) => {
-    server = http.createServer(rootHandler);
-    server.listen(0, '127.0.0.1', () => {
-      port = (server.address() as { port: number }).port;
-      resolve();
-    });
-  });
+  fixtures = await startFixtureServer(['hello-node', 'failing-app']);
 }, 180_000);
 
 afterAll(async () => {
-  server?.close();
+  await fixtures?.close();
   await destroyTestContext(ctx);
-  await fsp.rm(gitRoot, { recursive: true, force: true }).catch(() => {});
 });
 
 async function waitForStatus(
@@ -97,12 +38,13 @@ async function waitForStatus(
   }
 }
 
+
 describe('deployment pipeline (docker)', () => {
   it('deploys hello-node to RUNNING, serves logs, stops cleanly', async () => {
     const create = await ctx.app.inject({
       method: 'POST',
       url: '/api/apps',
-      payload: { name: 'it-hello', repositoryUrl: `http://localhost:${port}/hello-node.git` },
+      payload: { name: 'it-hello', repositoryUrl: fixtures.url('hello-node') },
     });
     expect(create.statusCode).toBe(201);
     const appId = create.json().id;
@@ -147,7 +89,7 @@ describe('deployment pipeline (docker)', () => {
     const create = await ctx.app.inject({
       method: 'POST',
       url: '/api/apps',
-      payload: { name: 'it-crashy', repositoryUrl: `http://localhost:${port}/failing-app.git` },
+      payload: { name: 'it-crashy', repositoryUrl: fixtures.url('failing-app') },
     });
     const appId = create.json().id;
     const deploy = await ctx.app.inject({
@@ -171,7 +113,7 @@ describe('deployment pipeline (docker)', () => {
     const create = await ctx.app.inject({
       method: 'POST',
       url: '/api/apps',
-      payload: { name: 'it-missing', repositoryUrl: `http://localhost:${port}/does-not-exist.git` },
+      payload: { name: 'it-missing', repositoryUrl: fixtures.url('does-not-exist') },
     });
     const appId = create.json().id;
     const deploy = await ctx.app.inject({
