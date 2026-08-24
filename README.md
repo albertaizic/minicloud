@@ -1,14 +1,41 @@
 # MiniCloud
 
-**A lightweight local Platform-as-a-Service.** Deploy any git repository
-containing a Dockerfile to an isolated Docker container with a single command —
-inspired by Render, Heroku, Railway, and Fly.io, but running entirely on your
-machine.
+<div align="center">
+
+**Deploy any git repo to Docker with one command.**
+A lightweight, self-hosted Platform-as-a-Service for your own machine —
+the Render/Heroku/Railway/Fly.io developer experience, running locally.
+
+[![CI](https://github.com/albertaizic/minicloud/actions/workflows/ci.yml/badge.svg)](https://github.com/albertaizic/minicloud/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/badge/release-v0.1.0-58a6ff)](../../releases)
+[![Node](https://img.shields.io/badge/node-%E2%89%A520-3fb950?logo=nodedotjs&logoColor=white)](https://nodejs.org)
+[![TypeScript](https://img.shields.io/badge/TypeScript-strict-3178c6?logo=typescript&logoColor=white)](https://www.typescriptlang.org)
+[![License: MIT](https://img.shields.io/badge/license-MIT-8b949e)](LICENSE)
+
+</div>
+
+---
+
+MiniCloud turns a repository into a running, health-checked container:
 
 ```bash
 minicloud deploy https://github.com/example/my-api
 # ✔ deployment is RUNNING at http://localhost:31542
 ```
+
+It clones your repo, builds the Dockerfile, starts an isolated container on a
+free port, health-checks it, streams its logs live, detects crashes, and tracks
+every deployment in PostgreSQL — with a CLI and a web dashboard on top.
+
+| Overview | Deployment detail |
+|---|---|
+| ![MiniCloud dashboard overview](screenshots/overview.png) | ![MiniCloud deployment view](screenshots/deployment_view.png) |
+
+**Why this project exists.** MiniCloud is a deliberate, end-to-end exercise in
+platform engineering: a real deployment pipeline with a strict state machine,
+startup reconciliation between a database and Docker, crash detection, live log
+streaming, and a tested public API — the same problems cloud PaaS products
+solve, at an understandable scale.
 
 ## Features
 
@@ -184,6 +211,10 @@ What v0.1 does **not** do:
 - Containers can consume unbounded CPU/RAM/disk; no cgroups limits yet.
 - Built images execute arbitrary code from the repository during build *and* runtime — by design, but that means full host-level isolation must come from Docker itself, not MiniCloud.
 - The API has no authentication: anyone who can reach port 4000 can deploy anything Docker can do.
+
+## Release
+
+Current release: **v0.1.0** — see [CHANGELOG.md](CHANGELOG.md).
 
 ## License
 

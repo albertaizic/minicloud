@@ -1,0 +1,54 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  verify:
+    name: Typecheck, test, build
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: minicloud
+          POSTGRES_PASSWORD: minicloud
+          POSTGRES_DB: minicloud
+        ports:
+          - 5433:5432
+        options: >-
+          --health-cmd "pg_isready -U minicloud"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Unit and API tests
+        run: npm test
+        env:
+          DATABASE_URL: postgres://minicloud:minicloud@localhost:5433/minicloud
+
+      - name: Production build
+        run: npm run build
+
+      - name: Docker integration tests
+        run: npm run test:integration -w @minicloud/api
+        env:
+          DATABASE_URL: postgres://minicloud:minicloud@localhost:5433/minicloud
