@@ -4,10 +4,68 @@ import { api } from '../api.js';
 import ConfigPanel from '../components/ConfigPanel.js';
 import StatusBadge from '../components/StatusBadge.js';
 
+/** Restart policy selector: disabled | on-failure with a bounded attempt budget. */
+function RestartPolicyEditor({ appId, initial }: { appId: string; initial: { policy: string; maxRestartAttempts: number } }) {
+  const [policy, setPolicy] = useState(initial.policy);
+  const [max, setMax] = useState(String(initial.maxRestartAttempts));
+  const [error, setError] = useState('');
+  const [saved, setSaved] = useState(false);
+
+  const save = async () => {
+    setError('');
+    setSaved(false);
+    try {
+      const parsed = Number(max);
+      if (!Number.isInteger(parsed) || parsed < 0 || parsed > 10) throw new Error('max attempts must be 0-10');
+      const p = await api.setRestartPolicy(appId, policy, parsed);
+      setPolicy(p.policy);
+      setMax(String(p.maxRestartAttempts));
+      setSaved(true);
+      setTimeout(() => setSaved(false), 2500);
+    } catch (e) {
+      setError((e as Error).message);
+    }
+  };
+
+  return (
+    <div>
+      <p className="dim">
+        on-failure: a crashed RUNNING deployment is restarted automatically with
+        backoff, up to the attempt budget. Manual stop/restart resets the budget;
+        stopped or deleted deployments never restart on their own.
+      </p>
+      <form
+        className="actions"
+        onSubmit={(e) => {
+          e.preventDefault();
+          void save();
+        }}
+      >
+        <select value={policy} onChange={(e) => setPolicy(e.target.value)}>
+          <option value="disabled">disabled</option>
+          <option value="on-failure">on-failure</option>
+        </select>
+        <input
+          type="number"
+          min={0}
+          max={10}
+          value={max}
+          onChange={(e) => setMax(e.target.value)}
+          style={{ width: '6em' }}
+        />
+        <button type="submit" className="primary">Save policy</button>
+        {saved && <span className="dim">saved</span>}
+      </form>
+      {error && <p className="error">{error}</p>}
+    </div>
+  );
+}
+
 export default function AppDetail() {
   const { id } = useParams<{ id: string }>();
   const [data, setData] = useState<Awaited<ReturnType<typeof api.getApp>> | null>(null);
   const [error, setError] = useState('');
+  const [confirmRollbackTo, setConfirmRollbackTo] = useState<string | null>(null);
 
   const load = useCallback(() => {
     if (!id) return;
@@ -36,8 +94,11 @@ export default function AppDetail() {
 
   const act = async (fn: () => Promise<unknown>) => {
     setError('');
+    setConfirmRollbackTo(null);
     try { await fn(); setTimeout(load, 400); } catch (e) { setError((e as Error).message); }
   };
+
+  const rollbackTarget = data.deployments.find((d) => d.id === confirmRollbackTo);
 
   return (
     <div>
@@ -52,25 +113,56 @@ export default function AppDetail() {
           </>
         )}
       </div>
+      {error && <p className="error">{error}</p>}
+
+      <h2>Restart policy</h2>
+      <RestartPolicyEditor appId={data.id} initial={{ policy: data.restartPolicy, maxRestartAttempts: data.maxRestartAttempts }} />
+
       <h2>Configuration</h2>
       <ConfigPanel appId={data.id} />
+
       <h2>Deployments</h2>
       <table className="table">
         <thead>
-          <tr><th>ID</th><th>Status</th><th>Commit</th><th>Port</th><th>Created</th></tr>
+          <tr><th>ID</th><th>Status</th><th>Commit</th><th>Port</th><th>Created</th><th></th></tr>
         </thead>
         <tbody>
           {data.deployments.map((d) => (
             <tr key={d.id}>
               <td><Link to={`/deployments/${d.id}`} className="mono">{d.id.slice(0, 8)}</Link></td>
               <td><StatusBadge status={d.status} /></td>
-              <td className="mono dim">{d.commitSha?.slice(0, 7) ?? '—'}</td>
+              <td className="mono dim">
+                {d.commitSha?.slice(0, 7) ?? '—'}
+                {d.rollbackOf ? <span title={`rollback of ${d.rollbackOf.slice(0, 8)}`}> ↩</span> : null}
+              </td>
               <td className="mono">{d.hostPort ?? '—'}</td>
               <td className="dim">{new Date(d.createdAt).toLocaleString()}</td>
+              <td>
+                {d.imageTag && ['RUNNING', 'STOPPED', 'FAILED'].includes(d.status) && (
+                  confirmRollbackTo === d.id ? (
+                    <span>
+                      Roll back to this revision?
+                      {' '}
+                      <button className="primary" onClick={() => act(() => api.rollback(data.id, d.id))}>Yes</button>
+                      {' '}
+                      <button onClick={() => setConfirmRollbackTo(null)}>Cancel</button>
+                    </span>
+                  ) : (
+                    <button onClick={() => setConfirmRollbackTo(d.id)}>Rollback</button>
+                  )
+                )}
+              </td>
             </tr>
           ))}
         </tbody>
       </table>
+      {rollbackTarget && (
+        <p className="dim">
+          Rollback creates a <strong>new</strong> deployment running revision{' '}
+          <span className="mono">{rollbackTarget.commitSha?.slice(0, 7) ?? rollbackTarget.id.slice(0, 8)}</span> with
+          the application's current configuration. Historical deployments are never modified.
+        </p>
+      )}
     </div>
   );
 }

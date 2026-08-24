@@ -3,6 +3,8 @@ import { Link, useParams } from 'react-router-dom';
 import { api } from '../api.js';
 import StatusBadge from '../components/StatusBadge.js';
 import LogStream from '../components/LogStream.js';
+import MetricsCard from '../components/MetricsCard.js';
+import EventTimeline from '../components/EventTimeline.js';
 
 export default function DeploymentDetail() {
   const { id } = useParams<{ id: string }>();
@@ -54,7 +56,15 @@ export default function DeploymentDetail() {
           <dt>Created</dt><dd>{new Date(dep.createdAt).toLocaleString()}</dd>
           {dep.startedAt && (<><dt>Started</dt><dd>{new Date(dep.startedAt).toLocaleString()}</dd></>)}
           {dep.stoppedAt && (<><dt>Stopped</dt><dd>{new Date(dep.stoppedAt).toLocaleString()}</dd></>)}
-          {dep.restartCount > 0 && (<><dt>Restarts</dt><dd>{dep.restartCount}</dd></>)}
+          {dep.restartCount > 0 && (
+            <><dt>Restarts</dt><dd>{dep.restartCount}{dep.autoRestartCount > 0 ? <span className="dim"> ({dep.autoRestartCount} automatic)</span> : null}</dd></>
+          )}
+          {dep.rollbackOf && (
+            <>
+              <dt>Rollback of</dt>
+              <dd><Link to={`/deployments/${dep.rollbackOf}`} className="mono">{dep.rollbackOf.slice(0, 8)}</Link></dd>
+            </>
+          )}
           {dep.exitCode !== null && (<><dt>Exit code</dt><dd className="mono">{dep.exitCode}</dd></>)}
           {dep.failureReason && (<><dt>Failure</dt><dd className="error-text">{dep.failureReason}</dd></>)}
         </dl>
@@ -63,6 +73,11 @@ export default function DeploymentDetail() {
         <button onClick={() => act(() => api.restart(dep.id))}>Restart</button>
         <button onClick={() => act(() => api.stop(dep.id))}>Stop</button>
       </div>
+      {error && <p className="error">{error}</p>}
+      <h2>Metrics</h2>
+      <MetricsCard deploymentId={dep.id} status={dep.status} />
+      <h2>Events</h2>
+      <EventTimeline deploymentId={dep.id} />
       {dep.config && (
         <>
           <h2>Configuration used by this deployment</h2>
@@ -97,7 +112,7 @@ export default function DeploymentDetail() {
           </p>
         </>
       )}
-       <h2>Logs</h2>
+      <h2>Logs</h2>
       <LogStream deploymentId={dep.id} />
     </div>
   );
