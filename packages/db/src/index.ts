@@ -81,6 +81,8 @@ export interface ApplicationRow {
   name: string;
   repository_url: string;
   created_at: Date;
+  memory_limit_mb?: number | null;
+  cpu_limit?: number | null;
 }
 export interface DeploymentRow {
   id: string;
@@ -97,6 +99,7 @@ export interface DeploymentRow {
   failure_reason: string | null;
   exit_code: number | null;
   restart_count: number;
+  config_snapshot: Record<string, unknown> | null;
   created_at: Date;
   started_at: Date | null;
   stopped_at: Date | null;
@@ -222,6 +225,7 @@ export class DeploymentRepository {
       failure_reason: string | null;
       exit_code: number | null;
       restart_count: number;
+      config_snapshot: Record<string, unknown> | null;
       started_at: Date | null;
       stopped_at: Date | null;
     }>,
@@ -239,5 +243,153 @@ export class DeploymentRepository {
       [applicationId],
     );
     return res.rows[0] ?? null;
+  }
+}
+
+export interface AppEnvRow {
+  id: string;
+  application_id: string;
+  key: string;
+  encrypted_value: string | null;
+  plain_value: string | null;
+  is_secret: boolean;
+  created_at: Date;
+  updated_at: Date;
+}
+
+/**
+ * Per-application environment variables and secrets.
+ *
+ * Secrets are written and read only through this repository, which requires a
+ * master key; plaintext secret values never leave `resolveRuntimeEnv` /
+ * `setSecret`. Listing methods deliberately do not return secret values.
+ */
+export class AppConfigRepository {
+  constructor(private readonly db: Database) {}
+
+  // ---- plain variables -----------------------------------------------------
+
+  async setVar(applicationId: string, key: string, value: string): Promise<AppEnvRow> {
+    const res = await this.db.query<AppEnvRow>(
+      `INSERT INTO app_env (application_id, key, plain_value, is_secret)
+       VALUES ($1, $2, $3, false)
+       ON CONFLICT (application_id, key)
+       DO UPDATE SET plain_value = EXCLUDED.plain_value,
+                    encrypted_value = NULL, is_secret = false, updated_at = now()
+       RETURNING *`,
+      [applicationId, key, value],
+    );
+    return res.rows[0]!;
+  }
+
+  /** Delete by key. Returns 'var' | 'secret' | null (not found). */
+  async deleteKey(applicationId: string, key: string): Promise<'var' | 'secret' | null> {
+    const existing = await this.byKey(applicationId, key);
+    if (!existing) return null;
+    const kind = existing.is_secret ? ('secret' as const) : ('var' as const);
+    await this.db.query('DELETE FROM app_env WHERE application_id = $1 AND key = $2', [
+      applicationId,
+      key,
+    ]);
+    return kind;
+  }
+
+  async listVars(applicationId: string): Promise<{ key: string; value: string; updatedAt: Date }[]> {
+    const res = await this.db.query<AppEnvRow>(
+      `SELECT * FROM app_env WHERE application_id = $1 AND is_secret = false ORDER BY key`,
+      [applicationId],
+    );
+    return res.rows.map((r) => ({ key: r.key, value: r.plain_value ?? '', updatedAt: r.updated_at }));
+  }
+
+  // ---- secrets (encrypted at rest) ------------------------------------------
+
+  async setSecret(applicationId: string, key: string, ciphertext: string): Promise<void> {
+    await this.db.query(
+      `INSERT INTO app_env (application_id, key, encrypted_value, is_secret)
+       VALUES ($1, $2, $3, true)
+       ON CONFLICT (application_id, key)
+       DO UPDATE SET encrypted_value = EXCLUDED.encrypted_value,
+                    plain_value = NULL, is_secret = true, updated_at = now()`,
+      [applicationId, key, ciphertext],
+    );
+  }
+
+  /** Secret keys only — never values. */
+  async listSecretKeys(applicationId: string): Promise<{ key: string; updatedAt: Date }[]> {
+    const res = await this.db.query<AppEnvRow>(
+      `SELECT * FROM app_env WHERE application_id = $1 AND is_secret = true ORDER BY key`,
+      [applicationId],
+    );
+    return res.rows.map((r) => ({ key: r.key, updatedAt: r.updated_at }));
+  }
+
+  async byKey(applicationId: string, key: string): Promise<AppEnvRow | null> {
+    const res = await this.db.query<AppEnvRow>(
+      'SELECT * FROM app_env WHERE application_id = $1 AND key = $2',
+      [applicationId, key],
+    );
+    return res.rows[0] ?? null;
+  }
+
+  /**
+   * Resolve the full runtime environment for a deployment start:
+   * plain vars decrypted-free plus secrets decrypted via the master key.
+   * This is the ONLY path that turns stored secrets into plaintext values.
+   */
+  async resolveRuntimeEnv(
+    applicationId: string,
+    masterKey: Buffer | null,
+    decrypt: (stored: string, key: Buffer | null) => string,
+  ): Promise<{ env: Record<string, string>; secretKeys: string[] }> {
+    const rows = await this.db.query<AppEnvRow>(
+      'SELECT * FROM app_env WHERE application_id = $1 ORDER BY key',
+      [applicationId],
+    );
+    const env: Record<string, string> = {};
+    const secretKeys: string[] = [];
+    for (const r of rows.rows) {
+      if (r.is_secret) {
+        if (!r.encrypted_value) continue;
+        env[r.key] = decrypt(r.encrypted_value, masterKey);
+        secretKeys.push(r.key);
+      } else {
+        env[r.key] = r.plain_value ?? '';
+      }
+    }
+    return { env, secretKeys };
+  }
+
+  // ---- resource limits -------------------------------------------------------
+
+  async getLimits(
+    applicationId: string,
+  ): Promise<{ memoryLimitMb: number | null; cpuLimit: number | null }> {
+    const res = await this.db.query<{ memory_limit_mb: number | null; cpu_limit: number | null }>(
+      'SELECT memory_limit_mb, cpu_limit FROM applications WHERE id = $1',
+      [applicationId],
+    );
+    const row = res.rows[0];
+    return { memoryLimitMb: row?.memory_limit_mb ?? null, cpuLimit: row?.cpu_limit ?? null };
+  }
+
+  async setLimits(
+    applicationId: string,
+    limits: { memoryLimitMb?: number; cpuLimit?: number },
+  ): Promise<void> {
+    await this.db.query(
+      `UPDATE applications SET
+         memory_limit_mb = COALESCE($2, memory_limit_mb),
+         cpu_limit = COALESCE($3, cpu_limit)
+       WHERE id = $1`,
+      [applicationId, limits.memoryLimitMb ?? null, limits.cpuLimit ?? null],
+    );
+  }
+
+  async clearLimits(applicationId: string): Promise<void> {
+    await this.db.query(
+      'UPDATE applications SET memory_limit_mb = NULL, cpu_limit = NULL WHERE id = $1',
+      [applicationId],
+    );
   }
 }
