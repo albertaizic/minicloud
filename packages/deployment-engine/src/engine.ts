@@ -23,7 +23,7 @@ import {
   type DeploymentRow,
 } from '@minicloud/db';
 import { DockerRuntime, DockerUnavailableError } from '@minicloud/docker-runtime';
-import { cloneRepository, CloneError } from './git.js';
+import { cloneRepository } from './git.js';
 import { allocatePort, canBind } from './ports.js';
 import { waitForHealthy } from './health.js';
 
@@ -60,7 +60,7 @@ export type LogListener = (
   entry: { source: 'build' | 'container' | 'system'; stream: 'stdout' | 'stderr'; message: string },
 ) => void;
 
-const MAX_LOG_LISTENERS_WARN = 500;
+const MAX_LOCK_MAP_SIZE = 500;
 
 export class DeploymentEngine {
   private readonly deployments: DeploymentRepository;
@@ -95,7 +95,7 @@ export class DeploymentEngine {
       next.catch(() => {}),
     );
     // Opportunistic cleanup to avoid unbounded map growth.
-    if (this.locks.size > MAX_LOG_LISTENERS_WARN) {
+    if (this.locks.size > MAX_LOCK_MAP_SIZE) {
       for (const [k, p] of this.locks) {
         if (p === prev) this.locks.delete(k);
       }
@@ -305,6 +305,7 @@ export class DeploymentEngine {
       }
       await this.docker.stop(containerId).catch(() => {});
       await this.docker.remove(containerId, true).catch(() => {});
+      await this.deployments.updateFields(deploymentId, { container_id: null, container_name: null });
       await this.failWithExitCode(deploymentId, `Health check failed after ${this.config.defaults.healthTimeoutSeconds}s: ${health.lastError}`);
       return;
     }
@@ -367,8 +368,9 @@ export class DeploymentEngine {
           this.logger.warn('container stop error (ignored)', { deploymentId, error: String(err) });
         });
         await this.docker.remove(row.container_id, true).catch(() => {});
-        await this.deployments.updateFields(deploymentId, { container_id: row.container_id });
+        await this.deployments.updateFields(deploymentId, { container_id: null, container_name: null });
       }
+      this.activeRuns.delete(deploymentId);
       this.logger.info('deployment stopped', { deploymentId });
       return row;
     });
@@ -429,6 +431,7 @@ export class DeploymentEngine {
       if (!health.ok) {
         await this.docker.stop(started.id).catch(() => {});
         await this.docker.remove(started.id, true).catch(() => {});
+        await this.deployments.updateFields(deploymentId, { container_id: null, container_name: null });
         await this.deployments.transitionStatus(deploymentId, ['HEALTH_CHECKING'], 'FAILED', {
           failure_reason: `Restart health check failed: ${health.lastError}`,
         }, { stoppedAt: new Date() });
@@ -452,9 +455,8 @@ export class DeploymentEngine {
         await this.docker.stop(row.container_id).catch(() => {});
         await this.docker.remove(row.container_id, true).catch(() => {});
       }
-      if (row.image_tag) {
-        // Best-effort image cleanup via runtime is handled lazily; images are content-addressed and small here.
-      }
+      // Images are left in place: they are content-addressed by deployment id
+      // and pruned manually if disk space matters.
       await this.db.query('DELETE FROM deployments WHERE id = $1', [deploymentId]);
       this.logger.info('deployment deleted', { deploymentId });
     });

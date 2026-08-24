@@ -14,7 +14,7 @@ import {
   type EngineConfig,
   type LogListener,
 } from '@minicloud/deployment-engine';
-import { createAppSchema, deployAppSchema, isValidId, isActive, type DeploymentStatus } from '@minicloud/shared';
+import { createAppSchema, deployAppSchema, isValidId, type DeploymentStatus } from '@minicloud/shared';
 
 export interface BuildAppOptions {
   db: Database;
@@ -83,7 +83,6 @@ export async function buildApp(opts: BuildAppOptions): Promise<FastifyInstance> 
     }
   };
   // Register our fan-out with the engine via a permanent listener.
-  (engine as unknown as { __registerFanout?: unknown });
   attachEngineLogForwarding(engine, engineListener);
 
   function subscribeLogs(deploymentId: string, listener: LogListener): () => void {
@@ -218,7 +217,8 @@ export async function buildApp(opts: BuildAppOptions): Promise<FastifyInstance> 
     if (!isValidId(id)) return reply.code(400).send({ error: 'Invalid deployment id' });
     const row = await deployments.byId(id);
     if (!row) return reply.code(404).send({ error: 'Deployment not found' });
-    if (!isActive(row.status as DeploymentStatus) && row.status !== 'RUNNING') {
+    const stoppable = ['QUEUED','CLONING','BUILDING','STARTING','HEALTH_CHECKING','RUNNING'];
+    if (!stoppable.includes(row.status)) {
       return reply.code(409).send({ error: `Cannot stop deployment in state ${row.status}` });
     }
     const updated = await engine.stopDeployment(id);
