@@ -110,3 +110,55 @@ export const api = {
     });
   },
 };
+
+// ---- Short-ID resolution ---------------------------------------------------
+// The CLI displays 8-character ID prefixes. Any command accepting an
+// application/deployment id also accepts such a prefix, as long as it is
+// unambiguous among the currently known objects.
+
+const FULL_UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const SHORT_ID_RE = /^[0-9a-f]{4,12}$/i;
+
+export class AmbiguousIdError extends Error {
+  constructor(kind: string, prefix: string, matches: string[]) {
+    super(
+      `Ambiguous ${kind} id "${prefix}" matches ${matches.length} entries:\n` +
+        matches.map((m) => `  ${m}`).join('\n') +
+        `\nUse a longer prefix.`,
+    );
+    this.name = 'AmbiguousIdError';
+  }
+}
+
+export function isFullUuid(id: string): boolean {
+  return FULL_UUID_RE.test(id);
+}
+
+/** Resolve a possibly-short deployment id to its full UUID via /api/deployments. */
+export async function resolveDeploymentId(idOrPrefix: string): Promise<string> {
+  if (isFullUuid(idOrPrefix)) return idOrPrefix;
+  const deps = await api.listDeployments();
+  const matches = deps.filter((d) => d.id.startsWith(idOrPrefix)).map((d) => d.id);
+  if (matches.length === 0) return idOrPrefix; // let the API produce the not-found error
+  if (matches.length > 1) throw new AmbiguousIdError('deployment', idOrPrefix, matches);
+  return matches[0]!;
+}
+
+/** Resolve a possibly-short app id (or name) to its full UUID. */
+export async function resolveAppId(idOrPrefixOrName: string): Promise<string> {
+  const apps: AppDto[] = await api.listApps();
+  const byName = apps.find((a) => a.name === idOrPrefixOrName);
+  if (byName) return byName.id;
+  if (isFullUuid(idOrPrefixOrName)) return idOrPrefixOrName;
+  const matches = apps.filter((a) => a.id.startsWith(idOrPrefixOrName)).map((a) => a.id);
+  if (matches.length === 0) return idOrPrefixOrName;
+  if (matches.length > 1) throw new AmbiguousIdError('application', idOrPrefixOrName, matches);
+  return matches[0]!;
+}
+
+/** Validate shape early so garbage like "abc" fails fast with a clear message. */
+export function assertPlausibleId(id: string): void {
+  if (!id || !(FULL_UUID_RE.test(id) || SHORT_ID_RE.test(id))) {
+    throw new Error(`"${id}" is not a valid deployment or application id`);
+  }
+}

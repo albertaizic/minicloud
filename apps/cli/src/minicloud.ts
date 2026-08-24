@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // minicloud CLI
-import { api, ApiError, type AppDto, type DeploymentDto } from './api-client.js';
+import { api, ApiError, resolveDeploymentId, assertPlausibleId, type AppDto, type DeploymentDto } from './api-client.js';
 
 const c = (code: string) => (s: string) => `\x1b[${code}m${s}\x1b[0m`;
 const bold = c('1');
@@ -52,6 +52,17 @@ function short(id: string): string {
   return id.slice(0, 8);
 }
 
+/** Accept a full UUID or an unambiguous 4-12 char prefix; fail clearly otherwise. */
+async function deploymentIdArg(raw: string): Promise<string> {
+  if (!raw) fail('missing <deployment-id> argument');
+  try {
+    assertPlausibleId(raw);
+    return await resolveDeploymentId(raw);
+  } catch (err) {
+    fail(err instanceof Error ? err.message : String(err));
+  }
+}
+
 async function waitForTerminal(deploymentId: string): Promise<DeploymentDto> {
   const spinner = ['|', '/', '-', '\\'];
   let i = 0;
@@ -93,10 +104,12 @@ async function cmdDeploy(url: string, opts: { name?: string; ref?: string }): Pr
   }
 }
 
-async function cmdLogs(id: string): Promise<void> {
+async function cmdLogs(idOrPrefix: string): Promise<void> {
+  const id = await deploymentIdArg(idOrPrefix);
   const d = await api.getDeployment(id).catch(() => fail(`deployment ${id} not found`));
+  const fullId = d.id;
   console.log(dim(`--- logs for ${short(d.id)} (${d.status}) ---`));
-  await api.streamLogs(id, (line) => console.log(line)).catch((err) => fail(err instanceof ApiError ? err.message : String(err)));
+  await api.streamLogs(fullId, (line) => console.log(line)).catch((err) => fail(err instanceof ApiError ? err.message : String(err)));
   // keep the process alive while the stream is open
   setInterval(() => {}, 1 << 30);
 }
@@ -153,7 +166,8 @@ async function main(): Promise<void> {
       return;
     }
     case 'status': {
-      const d = await api.getDeployment(positional[0] ?? '').catch(() => fail('deployment not found'));
+      const id = await deploymentIdArg(positional[0] ?? '');
+      const d = await api.getDeployment(id).catch(() => fail('deployment not found'));
       console.log(`deployment ${bold(d.id)}`);
       console.log(`  status:   ${statusColor(d.status)}`);
       console.log(`  commit:   ${d.commitSha ?? '—'}`);
@@ -168,13 +182,15 @@ async function main(): Promise<void> {
       await cmdLogs(positional[0] ?? '');
       return;
     case 'stop': {
-      const d = await api.stop(positional[0] ?? '');
+      const id = await deploymentIdArg(positional[0] ?? '');
+      const d = await api.stop(id);
       console.log(`${yellow('■')} deployment ${short(d.id)} ${d.status}`);
       return;
     }
     case 'restart': {
+      const id = await deploymentIdArg(positional[0] ?? '');
       console.log('restarting…');
-      const d = await waitForTerminal((await api.restart(positional[0] ?? '')).id);
+      const d = await waitForTerminal((await api.restart(id)).id);
       if (d.status === 'RUNNING') console.log(green(`✔ restarted: ${d.url}`));
       else {
         console.log(red(`✖ restart ended in ${d.status}`));
@@ -184,12 +200,14 @@ async function main(): Promise<void> {
       return;
     }
     case 'delete': {
-      await api.deleteDeployment(positional[0] ?? '');
-      console.log(`deleted deployment ${short(positional[0] ?? '')}`);
+      const id = await deploymentIdArg(positional[0] ?? '');
+      await api.deleteDeployment(id);
+      console.log(`deleted deployment ${short(id)}`);
       return;
     }
     case 'wait': {
-      const d = await waitForTerminal(positional[0] ?? '');
+      const id = await deploymentIdArg(positional[0] ?? '');
+      const d = await waitForTerminal(id);
       console.log(`${d.status}${d.url ? ` ${d.url}` : ''}`);
       return;
     }
