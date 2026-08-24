@@ -6,6 +6,7 @@ import {
   AppRepository,
   DeploymentRepository,
   AppConfigRepository,
+  DeploymentEventRepository,
   type ApplicationRow,
   type DeploymentRow,
 } from '@minicloud/db';
@@ -21,6 +22,8 @@ import {
   setEnvVarSchema,
   setSecretSchema,
   updateLimitsSchema,
+  restartPolicySchema,
+  rollbackSchema,
   isValidId,
   encryptSecret,
   decryptSecret,
@@ -52,6 +55,8 @@ function serializeApp(row: ApplicationRow) {
       memoryLimitMb: row.memory_limit_mb ?? null,
       cpuLimit: row.cpu_limit ?? null,
     },
+    restartPolicy: row.restart_policy,
+    maxRestartAttempts: row.max_restart_attempts,
   };
 }
 
@@ -77,6 +82,8 @@ function serializeDeployment(row: DeploymentRow) {
     failureReason: row.failure_reason,
     exitCode: row.exit_code,
     restartCount: row.restart_count,
+    autoRestartCount: row.auto_restart_count,
+    rollbackOf: row.rollback_of_deployment_id,
     config: serializeSnapshot(row.config_snapshot),
     createdAt: row.created_at,
     startedAt: row.started_at,
@@ -101,6 +108,7 @@ export async function buildApp(opts: BuildAppOptions): Promise<FastifyInstance> 
   const apps = new AppRepository(db);
   const deployments = new DeploymentRepository(db);
   const appConfig = new AppConfigRepository(db);
+  const events = new DeploymentEventRepository(db);
 
   // Master key: injected by tests or loaded from MINICLOUD_MASTER_KEY. An
   // absent variable means null — secrets stay disabled until configured. A
@@ -299,6 +307,121 @@ export async function buildApp(opts: BuildAppOptions): Promise<FastifyInstance> 
     return serializeApp((await apps.byId(row.id))!).limits;
   });
 
+
+  // ---- reliability & observability (v0.3) -----------------------------------
+
+  app.get('/api/deployments/:id/events', async (req, reply) => {
+    const { id } = req.params as { id: string };
+    if (!isValidId(id)) return reply.code(400).send({ error: 'Invalid deployment id' });
+    const row = await deployments.byId(id);
+    if (!row) return reply.code(404).send({ error: 'Deployment not found' });
+    const list = await events.listByDeployment(id);
+    return {
+      deploymentId: id,
+      events: list.map((e) => ({
+        id: e.id,
+        type: e.event_type,
+        message: e.message,
+        metadata: e.metadata,
+        createdAt: e.created_at,
+      })),
+    };
+  });
+
+  app.get('/api/deployments/:id/metrics', async (req, reply) => {
+    const { id } = req.params as { id: string };
+    if (!isValidId(id)) return reply.code(400).send({ error: 'Invalid deployment id' });
+    const row = await deployments.byId(id);
+    if (!row) return reply.code(404).send({ error: 'Deployment not found' });
+    if (row.status !== 'RUNNING' || !row.container_id) {
+      return reply.code(409).send({
+        error: `Metrics are only available for RUNNING deployments (current: ${row.status})`,
+        status: row.status,
+      });
+    }
+    const stats = await docker.stats(row.container_id).catch((err) => {
+      req.log.warn({ deploymentId: id, error: String(err) }, 'stats unavailable');
+      return null;
+    });
+    if (!stats) {
+      return reply.code(409).send({ error: 'Container metrics are unavailable right now', status: row.status });
+    }
+    return {
+      deploymentId: id,
+      status: row.status,
+      containerState: 'running',
+      restartCount: row.restart_count,
+      autoRestartCount: row.auto_restart_count,
+      startedAt: row.started_at,
+      cpuPercent: stats.cpuPercent,
+      memoryUsedBytes: stats.memoryUsedBytes,
+      memoryLimitBytes: stats.memoryLimitBytes,
+      memoryPercent: stats.memoryPercent,
+    };
+  });
+
+  app.post('/api/apps/:id/rollback', async (req, reply) => {
+    const { id } = req.params as { id: string };
+    if (!isValidId(id)) return reply.code(400).send({ error: 'Invalid application id' });
+    const appRow = await apps.byId(id);
+    if (!appRow) return reply.code(404).send({ error: 'Application not found' });
+    const parsed = rollbackSchema.safeParse(req.body ?? {});
+    if (!parsed.success) {
+      return reply.code(400).send({ error: 'Invalid request', details: parsed.error.flatten().fieldErrors });
+    }
+    const targetId = parsed.data.targetDeploymentId;
+    if (!isValidId(targetId)) {
+      return reply.code(400).send({ error: 'Invalid target deployment id' });
+    }
+    try {
+      const dep = await engine.rollbackDeployment(id, targetId);
+      req.log.info({ deploymentId: dep.id, appId: id, rollbackOf: targetId }, 'rollback queued');
+      return reply.code(202).send({
+        deployment: serializeDeployment(dep),
+        message: 'Rollback queued',
+      });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'Rollback failed';
+      if (/not found/i.test(msg)) return reply.code(404).send({ error: msg });
+      if (/different application|no built image|in progress|could not be determined/i.test(msg)) {
+        return reply.code(409).send({ error: msg });
+      }
+      req.log.error({ err, appId: id }, 'rollback failed');
+      return reply.code(500).send({ error: 'Rollback failed' });
+    }
+  });
+
+  app.get('/api/apps/:id/restart-policy', async (req, reply) => {
+    const { id } = req.params as { id: string };
+    if (!isValidId(id)) return reply.code(400).send({ error: 'Invalid application id' });
+    const row = await apps.byId(id);
+    if (!row) return reply.code(404).send({ error: 'Application not found' });
+    return { policy: row.restart_policy, maxRestartAttempts: row.max_restart_attempts };
+  });
+
+  app.put('/api/apps/:id/restart-policy', async (req, reply) => {
+    const { id } = req.params as { id: string };
+    if (!isValidId(id)) return reply.code(400).send({ error: 'Invalid application id' });
+    const row = await apps.byId(id);
+    if (!row) return reply.code(404).send({ error: 'Application not found' });
+    const parsed = restartPolicySchema.safeParse(req.body ?? {});
+    if (!parsed.success) {
+      return reply.code(400).send({ error: 'Invalid request', details: parsed.error.flatten().fieldErrors });
+    }
+    const policy = parsed.data.policy;
+    const max = parsed.data.maxRestartAttempts ?? row.max_restart_attempts;
+    await apps.setRestartPolicy(id, policy, max);
+    req.log.info({ appId: id, policy, maxRestartAttempts: max }, 'restart policy updated');
+    return { policy, maxRestartAttempts: max };
+  });
+
+  app.post('/api/prune', async (req, reply) => {
+    const result = await engine.prune();
+    req.log.info(result, 'prune executed via api');
+    return result;
+  });
+
+  // ---- health -------------------------------------------------------------
   // ---- health -------------------------------------------------------------
   app.get('/api/health', async (_req, reply) => {
     let dockerOk = true;
@@ -511,38 +634,15 @@ export async function buildApp(opts: BuildAppOptions): Promise<FastifyInstance> 
     });
   });
 
-  // Crash monitor: detect RUNNING containers that exit unexpectedly.
+  // Crash monitor + automatic-recovery ticks. All logic lives in the engine
+  // so the same code path serves live monitoring and startup reconciliation.
   const monitorInterval = Number(process.env.CRASH_MONITOR_INTERVAL_MS ?? 5000);
   const monitor = setInterval(() => {
-    void checkCrashes().catch((err) => {
+    void engine.checkCrashes().catch((err) => {
       app.log.error({ err }, 'crash monitor error');
     });
   }, monitorInterval);
   monitor.unref();
-
-  async function checkCrashes(): Promise<void> {
-    const rows = await db.query<{ id: string; container_id: string | null; status: string }>(
-      `SELECT d.id, d.container_id, d.status
-       FROM deployments d
-       WHERE d.status IN ('RUNNING')`,
-    );
-    for (const row of rows.rows) {
-      if (!row.container_id) continue;
-      const state = await docker.getContainerState(row.container_id).catch(() => null);
-      if (state === null || !state.running) {
-        await db.query(
-          `UPDATE deployments SET status='FAILED', failure_reason=$2, exit_code=$3, stopped_at=now()
-           WHERE id=$1 AND status='RUNNING'`,
-          [
-            row.id,
-            state === null ? 'Container disappeared unexpectedly' : 'Container exited unexpectedly',
-            state?.exitCode ?? null,
-          ],
-        );
-        app.log.warn({ deploymentId: row.id, exitCode: state?.exitCode }, 'container crashed');
-      }
-    }
-  }
 
   app.addHook('onClose', async () => {
     clearInterval(monitor);

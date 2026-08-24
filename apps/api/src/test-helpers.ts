@@ -19,6 +19,8 @@ export interface TestContext {
   app: FastifyInstance;
   db: Database;
   dbName: string;
+  engine: DeploymentEngine;
+  docker: DockerRuntime;
 }
 
 export async function createTestApp(opts: { withMasterKey?: boolean } = {}): Promise<TestContext> {
@@ -59,7 +61,7 @@ export async function createTestApp(opts: { withMasterKey?: boolean } = {}): Pro
     ...(opts.withMasterKey === false ? {} : { masterKey: TEST_MASTER_KEY }),
   });
   await app.ready();
-  return { app, db, dbName };
+  return { app, db, dbName, engine, docker };
 }
 
 export async function destroyTestContext(ctx: TestContext): Promise<void> {

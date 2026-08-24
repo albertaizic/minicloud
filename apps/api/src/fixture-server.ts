@@ -11,32 +11,54 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 
 const run = promisify(execFile);
-
 export interface FixtureServer {
   /** Base URL like http://127.0.0.1:<port>/<name>.git */
   url(name: string): string;
+  /** Commit SHA of revision N (0-based) for multi-revision fixtures. */
+  sha(name: string, revision: number): string;
   close(): Promise<void>;
 }
 
-export async function startFixtureServer(names: string[]): Promise<FixtureServer> {
+export type FixtureSpec = string | { name: string; revisions: string[] };
+
+export async function startFixtureServer(specs: FixtureSpec[]): Promise<FixtureServer> {
   const repoRoot = path.resolve(import.meta.dirname ?? '.', '../../../examples');
   const gitRoot = path.join(os.tmpdir(), `minicloud-it-git-${Date.now()}`);
   await fsp.mkdir(gitRoot, { recursive: true });
 
-  for (const name of names) {
+  const shas = new Map<string, string[]>();
+  for (const spec of specs) {
+    const [name, revisions] =
+      typeof spec === 'string' ? [spec, [spec]] : [spec.name, spec.revisions];
     const bare = path.join(gitRoot, `${name}.git`);
     await run('git', ['init', '--bare', '-q', bare]);
     const work = path.join(gitRoot, `work-${name}`);
     await run('git', ['clone', '-q', bare, work]);
-    const files = await fsp.readdir(path.join(repoRoot, name));
-    for (const f of files) {
-      await fsp.copyFile(path.join(repoRoot, name, f), path.join(work, f));
+    const commitShas: string[] = [];
+    for (const revision of revisions) {
+      const files = await fsp.readdir(path.join(repoRoot, revision));
+      for (const f of files) {
+        const dest = path.join(work, f);
+        await fsp.copyFile(path.join(repoRoot, revision, f), dest);
+        // Windows CopyFileW preserves the source mtime; an older mtime than
+        // the git index makes `git add` skip re-hashing (racy-git heuristic),
+        // so identical-size changes are missed. Normalize to now.
+        const now = new Date();
+        await fsp.utimes(dest, now, now);
+      }
+      await run('git', ['add', '-A'], { cwd: work });
+      await run(
+        'git',
+        ['-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-qm', `fixture ${revision}`],
+        { cwd: work },
+      );
+      commitShas.push((await run('git', ['-C', work, 'rev-parse', 'HEAD'])).stdout.trim());
     }
-    await run('git', ['add', '-A'], { cwd: work });
-    await run('git', ['-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-qm', 'fixture'], { cwd: work });
     await run('git', ['push', '-q'], { cwd: work });
     await run('git', ['update-server-info'], { cwd: bare });
+    shas.set(name, commitShas);
   }
+
 
   const rootHandler: http.RequestListener = (req, res) => {
     // Minimal static file serving of the git dir tree.
@@ -68,6 +90,11 @@ export async function startFixtureServer(names: string[]): Promise<FixtureServer
 
   return {
     url: (name: string) => `http://localhost:${port}/${name}.git`,
+    sha: (name: string, revision: number) => {
+      const list = shas.get(name);
+      if (!list || !list[revision]) throw new Error(`no revision ${revision} for fixture ${name}`);
+      return list[revision]!;
+    },
     close: async () => {
       await new Promise<void>((resolve) => server.close(() => resolve()));
       await fsp.rm(gitRoot, { recursive: true, force: true }).catch(() => {});
