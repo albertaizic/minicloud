@@ -101,6 +101,38 @@ export type ResourceLimits = z.infer<typeof resourceLimitsSchema>;
 
 export const updateLimitsSchema = resourceLimitsSchema;
 
+// ---- Restart policy (v0.3) ---------------------------------------------------
+
+export const RESTART_POLICIES = ['disabled', 'on-failure'] as const;
+export type RestartPolicy = (typeof RESTART_POLICIES)[number];
+
+export const MAX_RESTART_ATTEMPTS_MIN = 0;
+export const MAX_RESTART_ATTEMPTS_MAX = 10;
+
+export const restartPolicySchema = z
+  .object({
+    policy: z.enum(RESTART_POLICIES),
+    maxRestartAttempts: z
+      .number()
+      .int()
+      .min(MAX_RESTART_ATTEMPTS_MIN)
+      .max(MAX_RESTART_ATTEMPTS_MAX)
+      .optional(),
+  })
+  .strict();
+
+export type RestartPolicyInput = z.infer<typeof restartPolicySchema>;
+
+// ---- Rollback (v0.3) ---------------------------------------------------------
+
+export const rollbackSchema = z
+  .object({
+    targetDeploymentId: z.string().trim().min(1).max(64),
+  })
+  .strict();
+
+export type RollbackInput = z.infer<typeof rollbackSchema>;
+
 /**
  * Effective runtime configuration for one deployment. Secrets are represented
  * by KEY names only — values are resolved at container start and never stored
