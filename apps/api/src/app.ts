@@ -5,6 +5,7 @@ import {
   Database,
   AppRepository,
   DeploymentRepository,
+  AppConfigRepository,
   type ApplicationRow,
   type DeploymentRow,
 } from '@minicloud/db';
@@ -14,19 +15,51 @@ import {
   type EngineConfig,
   type LogListener,
 } from '@minicloud/deployment-engine';
-import { createAppSchema, deployAppSchema, isValidId, type DeploymentStatus } from '@minicloud/shared';
+import {
+  createAppSchema,
+  deployAppSchema,
+  setEnvVarSchema,
+  setSecretSchema,
+  updateLimitsSchema,
+  isValidId,
+  encryptSecret,
+  decryptSecret,
+  loadMasterKeyFromEnv,
+  MasterKeyError,
+  buildConfigSnapshot,
+  type DeploymentConfigSnapshot,
+  type DeploymentStatus,
+} from '@minicloud/shared';
 
 export interface BuildAppOptions {
   db: Database;
   docker: DockerRuntime;
   engine: DeploymentEngine;
   engineConfig: EngineConfig;
+  /** AES key derived from MINICLOUD_MASTER_KEY; required only for secret operations. */
+  masterKey?: Buffer;
 }
 
 const MAX_SSE_CLIENTS_PER_DEPLOYMENT = 50;
 
 function serializeApp(row: ApplicationRow) {
-  return { id: row.id, name: row.name, repositoryUrl: row.repository_url, createdAt: row.created_at };
+  return {
+    id: row.id,
+    name: row.name,
+    repositoryUrl: row.repository_url,
+    createdAt: row.created_at,
+    limits: {
+      memoryLimitMb: row.memory_limit_mb ?? null,
+      cpuLimit: row.cpu_limit ?? null,
+    },
+  };
+}
+
+function serializeSnapshot(raw: Record<string, unknown> | null): DeploymentConfigSnapshot | null {
+  if (!raw || typeof raw !== 'object') return null;
+  const snap = raw as unknown as DeploymentConfigSnapshot;
+  if (!snap.env || !Array.isArray(snap.secretKeys)) return null;
+  return snap;
 }
 
 function serializeDeployment(row: DeploymentRow) {
@@ -44,6 +77,7 @@ function serializeDeployment(row: DeploymentRow) {
     failureReason: row.failure_reason,
     exitCode: row.exit_code,
     restartCount: row.restart_count,
+    config: serializeSnapshot(row.config_snapshot),
     createdAt: row.created_at,
     startedAt: row.started_at,
     stoppedAt: row.stopped_at,
@@ -66,6 +100,42 @@ export async function buildApp(opts: BuildAppOptions): Promise<FastifyInstance> 
 
   const apps = new AppRepository(db);
   const deployments = new DeploymentRepository(db);
+  const appConfig = new AppConfigRepository(db);
+
+  // Master key: injected by tests or loaded from MINICLOUD_MASTER_KEY. An
+  // absent variable means null — secrets stay disabled until configured. A
+  // present-but-invalid key fails startup loudly instead of silently
+  // degrading secret handling.
+  const masterKey =
+    opts.masterKey ?? (process.env.MINICLOUD_MASTER_KEY ? loadMasterKeyFromEnv() : null);
+
+  // The engine calls this at container start to get env/secrets/limits. It
+  // lives in the API because the master key must never leave this process;
+  // decrypted values flow straight into the container create call and are
+  // neither logged nor persisted.
+  engine.setAppConfigResolver(async (applicationId) => {
+    const decrypt = (stored: string, key: Buffer | null): string => {
+      if (!key) {
+        throw new MasterKeyError(
+          'Application has secrets but MINICLOUD_MASTER_KEY is not configured on the MiniCloud API process',
+        );
+      }
+      return decryptSecret(stored, key);
+    };
+    const { env, secretKeys } = await appConfig.resolveRuntimeEnv(applicationId, masterKey, decrypt);
+    const limits = await appConfig.getLimits(applicationId);
+    return {
+      env,
+      secretKeys,
+      limits:
+        limits.memoryLimitMb != null || limits.cpuLimit != null
+          ? {
+              ...(limits.memoryLimitMb != null ? { memoryLimitMb: limits.memoryLimitMb } : {}),
+              ...(limits.cpuLimit != null ? { cpuLimit: limits.cpuLimit } : {}),
+            }
+          : null,
+    };
+  });
 
   // ---- SSE fan-out registry -----------------------------------------------
   const logListeners = new Map<string, Set<LogListener>>();
@@ -97,6 +167,137 @@ export async function buildApp(opts: BuildAppOptions): Promise<FastifyInstance> 
       if (set!.size === 0) logListeners.delete(deploymentId);
     };
   }
+
+  // ---- application configuration -------------------------------------------
+
+  async function requireApp(id: string): Promise<ApplicationRow | null> {
+    if (!isValidId(id)) return null;
+    return apps.byId(id);
+  }
+
+  function noMasterKey(reply: { code: (n: number) => { send: (b: unknown) => unknown } }) {
+    return reply.code(503).send({
+      error:
+        'Secrets are not configured. Set MINICLOUD_MASTER_KEY (at least 16 characters) on the MiniCloud API and restart it.',
+    });
+  }
+
+  app.get('/api/apps/:id/env', async (req, reply) => {
+    const { id } = req.params as { id: string };
+    const row = await requireApp(id);
+    if (!row) return reply.code(404).send({ error: 'Application not found' });
+    const [vars, secretKeys] = await Promise.all([
+      appConfig.listVars(row.id),
+      appConfig.listSecretKeys(row.id),
+    ]);
+    // Secret values are never returned — keys and metadata only.
+    return {
+      variables: vars.map((v) => ({ key: v.key, value: v.value, updatedAt: v.updatedAt })),
+      secrets: secretKeys.map((s) => ({ key: s.key, updatedAt: s.updatedAt })),
+    };
+  });
+
+  app.put('/api/apps/:id/env/:key', async (req, reply) => {
+    const { id, key } = req.params as { id: string; key: string };
+    const row = await requireApp(id);
+    if (!row) return reply.code(404).send({ error: 'Application not found' });
+    const parsed = setEnvVarSchema.safeParse({ key, ...(req.body as object) });
+    if (!parsed.success) {
+      return reply.code(400).send({ error: 'Invalid request', details: parsed.error.flatten().fieldErrors });
+    }
+    // Never silently downgrade a secret to a plaintext variable.
+    const existingVar = await appConfig.byKey(row.id, parsed.data.key);
+    if (existingVar?.is_secret) {
+      return reply.code(409).send({
+        error: `"${parsed.data.key}" is stored as a secret. Delete the secret first to recreate it as a plain variable.`,
+      });
+    }
+    const saved = await appConfig.setVar(row.id, parsed.data.key, parsed.data.value);
+    req.log.info({ appId: row.id, envKey: parsed.data.key }, 'env var set');
+    return { key: saved.key, value: parsed.data.value, updatedAt: saved.updated_at };
+  });
+
+  app.delete('/api/apps/:id/env/:key', async (req, reply) => {
+    const { id, key } = req.params as { id: string; key: string };
+    const row = await requireApp(id);
+    if (!row) return reply.code(404).send({ error: 'Application not found' });
+    const deleted = await appConfig.deleteKey(row.id, key);
+    if (!deleted) return reply.code(404).send({ error: `No environment entry "${key}" on this application` });
+    req.log.info({ appId: row.id, envKey: key }, `env ${deleted} deleted`);
+    return reply.code(204).send();
+  });
+
+  app.put('/api/apps/:id/secrets/:key', async (req, reply) => {
+    const { id, key } = req.params as { id: string; key: string };
+    const row = await requireApp(id);
+    if (!row) return reply.code(404).send({ error: 'Application not found' });
+    if (!masterKey) return noMasterKey(reply);
+    const parsed = setSecretSchema.safeParse({ key, ...(req.body as object) });
+    if (!parsed.success) {
+      return reply.code(400).send({ error: 'Invalid request', details: parsed.error.flatten().fieldErrors });
+    }
+    // Never silently upgrade a plaintext variable to a secret.
+    const existingSecret = await appConfig.byKey(row.id, parsed.data.key);
+    if (existingSecret && !existingSecret.is_secret) {
+      return reply.code(409).send({
+        error: `"${parsed.data.key}" is stored as a plain variable. Delete the variable first to store it as a secret.`,
+      });
+    }
+    try {
+      await appConfig.setSecret(row.id, parsed.data.key, encryptSecret(parsed.data.value, masterKey));
+    } catch (err) {
+      req.log.error({ appId: row.id, err }, 'secret encryption failed');
+      return reply.code(500).send({ error: 'Failed to store secret' });
+    }
+    req.log.info({ appId: row.id, envKey: parsed.data.key }, 'secret set');
+    // Deliberately value-free response.
+    return reply.code(201).send({ key: parsed.data.key });
+  });
+
+  app.delete('/api/apps/:id/secrets/:key', async (req, reply) => {
+    const { id, key } = req.params as { id: string; key: string };
+    const row = await requireApp(id);
+    if (!row) return reply.code(404).send({ error: 'Application not found' });
+    const existing = await appConfig.byKey(row.id, key);
+    if (!existing || !existing.is_secret) {
+      return reply.code(404).send({ error: `No secret "${key}" on this application` });
+    }
+    await appConfig.deleteKey(row.id, key);
+    req.log.info({ appId: row.id, envKey: key }, 'secret deleted');
+    return reply.code(204).send();
+  });
+
+  app.get('/api/apps/:id/limits', async (req, reply) => {
+    const { id } = req.params as { id: string };
+    const row = await requireApp(id);
+    if (!row) return reply.code(404).send({ error: 'Application not found' });
+    return serializeApp(row).limits;
+  });
+
+  app.put('/api/apps/:id/limits', async (req, reply) => {
+    const { id } = req.params as { id: string };
+    const row = await requireApp(id);
+    if (!row) return reply.code(404).send({ error: 'Application not found' });
+    const parsed = updateLimitsSchema.safeParse(req.body);
+    if (!parsed.success) {
+      return reply.code(400).send({ error: 'Invalid request', details: parsed.error.flatten().fieldErrors });
+    }
+    await appConfig.setLimits(row.id, parsed.data);
+    req.log.info(
+      { appId: row.id, memoryLimitMb: parsed.data.memoryLimitMb ?? null, cpuLimit: parsed.data.cpuLimit ?? null },
+      'resource limits updated',
+    );
+    return serializeApp((await apps.byId(row.id))!).limits;
+  });
+
+  app.delete('/api/apps/:id/limits', async (req, reply) => {
+    const { id } = req.params as { id: string };
+    const row = await requireApp(id);
+    if (!row) return reply.code(404).send({ error: 'Application not found' });
+    await appConfig.clearLimits(row.id);
+    req.log.info({ appId: row.id }, 'resource limits cleared');
+    return serializeApp((await apps.byId(row.id))!).limits;
+  });
 
   // ---- health -------------------------------------------------------------
   app.get('/api/health', async (_req, reply) => {

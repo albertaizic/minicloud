@@ -10,7 +10,7 @@
     "build": "tsc -p tsconfig.build.json",
     "typecheck": "tsc --noEmit",
     "test": "vitest run --exclude '**/*.integration.test.ts'",
-    "test:integration": "vitest run src/pipeline.integration.test.ts",
+    "test:integration": "vitest run src/pipeline.integration.test.ts src/config.integration.test.ts",
     "test:unit": "npm test"
   },
   "dependencies": {

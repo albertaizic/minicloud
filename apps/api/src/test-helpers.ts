@@ -12,13 +12,18 @@ import path from 'node:path';
 const ADMIN_URL =
   process.env.DATABASE_URL ?? 'postgres://minicloud:minicloud@localhost:5433/postgres';
 
+/** Deterministic master key used by tests that exercise secret endpoints. */
+export const TEST_MASTER_KEY = Buffer.alloc(32, 3);
+
 export interface TestContext {
   app: FastifyInstance;
   db: Database;
   dbName: string;
 }
 
-export async function createTestApp(): Promise<TestContext> {
+export async function createTestApp(opts: { withMasterKey?: boolean } = {}): Promise<TestContext> {
+  // Deterministic behavior even if the operator shell exports a real key.
+  delete process.env.MINICLOUD_MASTER_KEY;
   const admin = new pg.Pool({ connectionString: ADMIN_URL });
   const dbName = `minicloud_test_${Date.now()}_${Math.floor(Math.random() * 1e6)}`;
   await admin.query(`CREATE DATABASE ${dbName}`);
@@ -46,7 +51,13 @@ export async function createTestApp(): Promise<TestContext> {
     error: () => {},
   };
   const engine = new DeploymentEngine(db, docker, engineConfig, logger);
-  const app = await buildApp({ db, docker, engine, engineConfig });
+  const app = await buildApp({
+    db,
+    docker,
+    engine,
+    engineConfig,
+    ...(opts.withMasterKey === false ? {} : { masterKey: TEST_MASTER_KEY }),
+  });
   await app.ready();
   return { app, db, dbName };
 }
