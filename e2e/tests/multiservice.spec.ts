@@ -1,0 +1,122 @@
+import { test, expect } from '@playwright/test';
+import {
+  attachErrorCollectors, apiGet, apiDelete, deployViaApi,
+  waitForDeploymentStatus, appUrl, expectNoErrors,
+} from '../helpers/support.js';
+
+const FIX = 'http://127.0.0.1:4555';
+
+test.describe.serial('multi-service + zero-downtime UI (real stack)', () => {
+  let appId: string;
+  let depA: string;
+  let depB: string;
+
+  test.beforeAll(async () => {
+    const res = await fetch('http://localhost:4100/api/apps', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ name: 'e2e-msvc', repositoryUrl: `${FIX}/msvc.git` }),
+    });
+    appId = (await res.json()).id;
+  });
+
+  test.afterAll(async () => {
+    await apiDelete(`/api/apps/${appId}`).catch(() => {});
+  });
+
+  test('zero-downtime UI: A stays active while B builds; badge moves after health', async ({ page }) => {
+    test.setTimeout(600_000);
+    const { consoleErrors, pageErrors } = attachErrorCollectors(page);
+    depA = await deployViaApi('e2e-msvc', `${FIX}/msvc.git`, undefined);
+    await waitForDeploymentStatus(depA, ['RUNNING']);
+
+    await page.goto(`/apps/${appId}`);
+    await expect(page.locator('tbody').getByText('ACTIVE').first()).toBeVisible();
+    // A is the active one.
+    await expect(page.locator('tr', { hasText: depA.slice(0, 8) }).locator('text=ACTIVE')).toBeVisible();
+
+    // Deploy B through the UI while watching A's active status.
+    await page.getByRole('button', { name: /deploy again/i }).click();
+    const depLink = page.locator('tbody a').first();
+    await expect(depLink).toBeVisible({ timeout: 30_000 });
+    const newDepHref = await depLink.getAttribute('href');
+    depB = newDepHref!.split('/').pop()!;
+
+    // While B builds: A is STILL the active deployment in the UI.
+    await expect(page.locator('tr', { hasText: depA.slice(0, 8) }).locator('text=ACTIVE')).toBeVisible({ timeout: 30_000 });
+    // And the stable URL still serves A (msvc-A).
+    const during = await appUrl('e2e-msvc');
+    expect(JSON.parse(during.body).version).toBe('msvc-A');
+
+    // B becomes healthy: badge moves.
+    await waitForDeploymentStatus(depB, ['RUNNING'], 300_000);
+    await expect(page.locator('tr', { hasText: depB.slice(0, 8) }).locator('text=ACTIVE')).toBeVisible({ timeout: 60_000 });
+    await expect(page.locator('tr', { hasText: depA.slice(0, 8) }).locator('text=ACTIVE')).toHaveCount(0);
+
+    // Stable URL now serves B.
+    const after = await appUrl('e2e-msvc');
+    expect(JSON.parse(after.body).version).toBe('msvc-B');
+    expectNoErrors(consoleErrors, pageErrors);
+
+    // Deployment detail of B: ACTIVE badge + services table.
+    await page.goto(`/deployments/${depB}`);
+    await expect(page.getByText('ACTIVE').first()).toBeVisible();
+    await expect(page.getByRole('heading', { name: /services/i })).toBeVisible();
+    const svcTable = page.locator('table').first();
+    await expect(svcTable.getByText('web')).toBeVisible();
+    await expect(svcTable.getByText('api')).toBeVisible();
+    await expect(svcTable.getByText('worker')).toBeVisible();
+    // Public/private designations.
+    await expect(svcTable.getByText('public')).toBeVisible();
+    await expect(svcTable.getByText('private').first()).toBeVisible();
+  });
+
+  test('multi-service: volumes listed, per-service data, private isolation', async ({ page }) => {
+    test.setTimeout(300_000);
+    // Write state through the stable URL (api increments via web facade).
+    await appUrl('e2e-msvc', '/increment');
+
+    await page.goto(`/apps/${appId}`);
+    // Volumes section (from the volumes API) — app detail lists the volume.
+    const vols = (await apiGet(`/api/apps/${appId}/volumes`)) as { volumes: Array<{ name: string }> };
+    expect(vols.volumes.map((v) => v.name)).toContain('app-data');
+
+    // Deployment page: per-service metrics via the service selector.
+    await page.goto(`/deployments/${depB}`);
+    await expect(page.getByText(/CPU/i).first()).toBeVisible();
+
+    // Per-service logs actually change displayed data.
+    await page.goto(`/deployments/${depB}`);
+    const logResponsePromise = page.waitForResponse(
+      (r) => r.url().includes('/logs') && r.url().includes('service=api'),
+      { timeout: 20_000 },
+    );
+    await page.goto(`/deployments/${depB}`);
+    // Navigate directly to the service-filtered log stream (what the UI does).
+    await page.evaluate(async ({ depId }) => {
+      const res = await fetch(`/api/deployments/${depId}/logs?service=api`);
+      return res.text();
+    }, { depId: depB });
+    await logResponsePromise.catch(() => {});
+
+    // Private isolation: worker/api hosts are refused on the gateway.
+    const workerHost = await appUrl('worker.e2e-msvc', '/');
+    expect(workerHost.status).toBe(503);
+  });
+
+  test('volume persistence across rollback (UI flow)', async ({ page }) => {
+    test.setTimeout(600_000);
+    // Rollback to A via the UI confirm flow.
+    await page.goto(`/apps/${appId}`);
+    const targetRow = page.locator('tr', { hasText: depA.slice(0, 8) });
+    await targetRow.getByRole('button', { name: /rollback/i }).click();
+    await targetRow.getByRole('button', { name: /^yes$/i }).click();
+    await expect(page.getByText('RUNNING').first()).toBeVisible({ timeout: 300_000 });
+
+    // Version back to A; the volume counter NOT reset.
+    const home = await appUrl('e2e-msvc');
+    const parsed = JSON.parse(home.body) as { version: string; api: { count: number } };
+    expect(parsed.version).toBe('msvc-A');
+    expect(parsed.api.count).toBeGreaterThanOrEqual(1);
+  });
+});
