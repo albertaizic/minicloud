@@ -106,6 +106,7 @@ export interface DeploymentRow {
   restart_count: number;
   config_snapshot: Record<string, unknown> | null;
   rollback_of_deployment_id: string | null;
+  manifest_snapshot: Record<string, unknown> | null;
   auto_restart_count: number;
   next_auto_restart_at: Date | null;
   created_at: Date;
@@ -304,6 +305,7 @@ export class DeploymentRepository {
       auto_restart_count: number;
       next_auto_restart_at: Date | null;
       config_snapshot: Record<string, unknown> | null;
+      manifest_snapshot: Record<string, unknown> | null;
       started_at: Date | null;
       stopped_at: Date | null;
     }>,
@@ -555,3 +557,5 @@ export class DeploymentEventRepository {
     return Number(res.rows[0]?.count ?? 0);
   }
 }
+
+export * from './service-repos.js';
