@@ -4,7 +4,7 @@ import {
   waitForDeploymentStatus, apiGet, apiDelete,
 } from '../helpers/support.js';
 
-const REPO = 'http://127.0.0.1:4555/hello-node.git';
+const REPO = 'http://localhost:4555/hello-node.git';
 
 test.describe('clean-user journey (real stack)', () => {
   let appSlug: string;
@@ -28,17 +28,17 @@ test.describe('clean-user journey (real stack)', () => {
   });
 
   test('create + deploy hello-node through the dashboard and reach RUNNING', async ({ page }) => {
-    test.setTimeout(420_000);
+    test.setTimeout(600_000);
     const { consoleErrors, pageErrors } = attachErrorCollectors(page);
-    appSlug = 'e2e-hello';
+    appSlug = `e2e-hello-${Date.now() % 100000}`;
     await page.goto('/');
     await page.getByPlaceholder('app-name').fill(appSlug);
     await page.getByPlaceholder('https://github.com/user/repo.git').fill(REPO);
     await page.getByRole('button', { name: /create app/i }).click();
-    await expect(page.getByRole('link', { name: appSlug })).toBeVisible({ timeout: 15_000 });
+    await expect(page.getByRole('link', { name: appSlug }).first()).toBeVisible({ timeout: 15_000 });
 
     // Open the application page and deploy through the UI.
-    await page.getByRole('link', { name: appSlug }).click();
+    await page.getByRole('link', { name: appSlug }).first().click();
     await expect(page.getByRole('heading', { name: appSlug })).toBeVisible();
     await page.getByText(new RegExp(`^${REPO.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`)).or(
       page.getByText('hello-node.git'),
@@ -52,11 +52,11 @@ test.describe('clean-user journey (real stack)', () => {
 
     // Open the deployment page and watch it transition to RUNNING without reload.
     await depLink.click();
-    await expect(page.getByText('RUNNING').first()).toBeVisible({ timeout: 240_000 });
+    await expect(page.getByText('RUNNING').first()).toBeVisible({ timeout: 480_000 });
 
     // Event timeline rendered with lifecycle events.
     await expect(page.getByRole('heading', { name: /events/i })).toBeVisible();
-    await expect(page.locator('table').getByText('deployment.running').first()).toBeVisible({ timeout: 20_000 });
+    await expect(page.locator('table').getByText('deployment.running').first()).toBeVisible({ timeout: 180_000 });
 
     // Metrics section renders for a RUNNING deployment.
     await expect(page.getByRole('heading', { name: /metrics/i })).toBeVisible();

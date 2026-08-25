@@ -1,18 +1,18 @@
 import { test, expect } from '@playwright/test';
 import { attachErrorCollectors, expectNoErrors, apiDelete } from '../helpers/support.js';
 
-const FIX = 'http://127.0.0.1:4555';
+const FIX = 'http://localhost:4555';
 
 test.describe('error-state UX (real stack)', () => {
   test('invalid repository shows a human-readable failure, no crash', async ({ page }) => {
     test.setTimeout(300_000);
     const { consoleErrors, pageErrors } = attachErrorCollectors(page);
     await page.goto('/');
-    await page.getByPlaceholder('app-name').fill('e2e-badrepo');
-    await page.getByPlaceholder('https://github.com/user/repo.git').fill('http://127.0.0.1:4555/does-not-exist.git');
+    await page.getByPlaceholder('app-name').fill(`e2e-badrepo-${Date.now() % 100000}`);
+    await page.getByPlaceholder('https://github.com/user/repo.git').fill('http://localhost:4555/does-not-exist.git');
     await page.getByRole('button', { name: /create app/i }).click();
-    await expect(page.getByRole('link', { name: 'e2e-badrepo' })).toBeVisible({ timeout: 15_000 });
-    await page.getByRole('link', { name: 'e2e-badrepo' }).click();
+    await expect(page.getByRole('link', { name: `e2e-badrepo-${Date.now() % 100000}` })).toBeVisible({ timeout: 15_000 });
+    await page.getByRole('link', { name: `e2e-badrepo-${Date.now() % 100000}` }).click();
     await page.getByRole('button', { name: /deploy again/i }).click();
 
     const depLink = page.locator('tbody a').first();
@@ -25,7 +25,7 @@ test.describe('error-state UX (real stack)', () => {
     expect(body).not.toMatch(/at .+ \(.*:\d+:\d+\)/); // no raw stack frames
     expectNoErrors(consoleErrors, pageErrors);
     const apps = (await (await fetch('http://localhost:4100/api/apps')).json()) as Array<{ id: string; name: string }>;
-    const app = apps.find((a) => a.name === 'e2e-badrepo');
+    const app = apps.find((a) => a.name === `e2e-badrepo-${Date.now() % 100000}`);
     if (app) await apiDelete(`/api/apps/${app.id}`);
   });
 
@@ -34,7 +34,7 @@ test.describe('error-state UX (real stack)', () => {
     const res = await fetch('http://localhost:4100/api/apps', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ name: 'e2e-badenv', repositoryUrl: `${FIX}/hello-node.git` }),
+      body: JSON.stringify({ name: `e2e-badenv-${Date.now() % 100000}`, repositoryUrl: `${FIX}/hello-node.git` }),
     });
     const appId = (await res.json()).id;
     await page.goto(`/apps/${appId}`);
@@ -53,7 +53,7 @@ test.describe('error-state UX (real stack)', () => {
     const res = await fetch('http://localhost:4100/api/apps', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ name: 'e2e-badlimit', repositoryUrl: `${FIX}/hello-node.git` }),
+      body: JSON.stringify({ name: `e2e-badlimit-${Date.now() % 100000}`, repositoryUrl: `${FIX}/hello-node.git` }),
     });
     const appId = (await res.json()).id;
     await page.goto(`/apps/${appId}`);

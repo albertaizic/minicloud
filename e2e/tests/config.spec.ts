@@ -1,7 +1,8 @@
 import { test, expect } from '@playwright/test';
+import { execSync } from 'node:child_process';
 import { attachErrorCollectors, expectNoErrors, apiGet, apiDelete } from '../helpers/support.js';
 
-const REPO = 'http://127.0.0.1:4555/hello-node.git';
+const REPO = 'http://localhost:4555/hello-node.git';
 let appId: string;
 
 test.describe.serial('configuration UI (env, secrets, limits, policy)', () => {
@@ -111,13 +112,10 @@ test.describe.serial('configuration UI (env, secrets, limits, policy)', () => {
       deployments: Array<{ id: string; containerName: string | null }>;
     };
     const containerName = detail.deployments.find((d) => d.id === detail.activeDeploymentId)!.containerName!;
-    const inspect = JSON.parse(
-      new TextDecoder().decode(
-        require('node:child_process').execSync(
-          `docker inspect ${containerName} --format "{{json .HostConfig.Memory}},{{json .HostConfig.NanoCpus}}"`,
-        ),
-      ).toString().split('\n').filter(Boolean).pop()!,
-    ) as [number, number];
+    const raw = execSync(
+      `docker inspect ${containerName} --format "{{json .HostConfig.Memory}},{{json .HostConfig.NanoCpus}}"`,
+    ).toString().trim();
+    const inspect = raw.split(',').map(Number) as [number, number];
     expect(inspect[0]).toBe(256 * 1024 * 1024);
     expect(inspect[1]).toBe(500_000_000);
     await apiDelete(`/api/deployments/${detail.activeDeploymentId}?force=true`);

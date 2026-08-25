@@ -39,7 +39,7 @@ export default function Overview() {
     <div>
       <h1>Applications</h1>
       <form onSubmit={submit} className="new-app-form">
-        <input placeholder="app-name" value={name} onChange={(e) => setName(e.target.value)} required pattern="[a-zA-Z0-9][a-zA-Z0-9-]*" />
+        <input placeholder="app-name" value={name} onChange={(e) => setName(e.target.value)} required />
         <input placeholder="https://github.com/user/repo.git" value={url} onChange={(e) => setUrl(e.target.value)} required style={{ flex: 2 }} />
         <button disabled={busy}>{busy ? 'Creating…' : 'Create app'}</button>
       </form>

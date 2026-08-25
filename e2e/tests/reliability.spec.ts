@@ -4,7 +4,7 @@ import {
   waitForDeploymentStatus, appUrl, expectNoErrors,
 } from '../helpers/support.js';
 
-const FIX = 'http://127.0.0.1:4555';
+const FIX = 'http://localhost:4555';
 
 test.describe.serial('reliability UI flows (real stack)', () => {
   let appId: string;

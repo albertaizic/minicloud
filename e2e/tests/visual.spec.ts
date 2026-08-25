@@ -2,7 +2,7 @@ import { test, expect, type Page } from '@playwright/test';
 import { attachErrorCollectors, expectNoErrors, apiGet, apiDelete, deployViaApi, waitForDeploymentStatus } from '../helpers/support.js';
 import fs from 'node:fs';
 
-const FIX = 'http://127.0.0.1:4555';
+const FIX = 'http://localhost:4555';
 const VIEWPORTS = [
   { name: 'desktop-1440', width: 1440, height: 900 },
   { name: 'laptop-1280', width: 1280, height: 720 },

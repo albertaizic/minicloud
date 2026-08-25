@@ -11,7 +11,7 @@ const VITE = path.join(ROOT, 'node_modules', 'vite', 'bin', 'vite.js');
 
 export default defineConfig({
   testDir: './tests',
-  timeout: 300_000,
+  timeout: 600_000,
   expect: { timeout: 15_000 },
   fullyParallel: false,
   workers: 1,

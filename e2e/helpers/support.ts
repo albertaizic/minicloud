@@ -54,13 +54,15 @@ export async function deployViaApi(name: string, repoUrl: string, ref?: string):
     body: JSON.stringify({ name, repositoryUrl: repoUrl }),
   });
   const app = await res.json();
+  if (!res.ok || !app.id) throw new Error(`create app failed: ${JSON.stringify(app)}`);
   const dres = await fetch(`${API}/api/apps/${app.id}/deploy`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify(ref ? { ref } : {}),
   });
-  const { deployment } = await dres.json();
-  return deployment.id;
+  const body = await dres.json();
+  if (!dres.ok || !body.deployment?.id) throw new Error(`deploy failed: ${JSON.stringify(body)}`);
+  return body.deployment.id;
 }
 
 /** Collect console errors + page errors on a page for the whole test. */
