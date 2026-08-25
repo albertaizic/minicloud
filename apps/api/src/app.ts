@@ -20,6 +20,7 @@ import {
 } from '@minicloud/deployment-engine';
 import { DockerRuntime } from '@minicloud/docker-runtime';
 import { Gateway, slugFromHost } from '@minicloud/gateway';
+import { registerAutoDeployRoutes } from './auto-deploy.js';
 import {
   createAppSchema,
   deployAppSchema,
@@ -148,6 +149,8 @@ export async function buildApp(opts: BuildAppOptions): Promise<FastifyInstance> 
 
   const servicesFor = async (deploymentId: string) =>
     (await services.listByDeployment(deploymentId)).map(serializeServiceRow);
+
+  registerAutoDeployRoutes(app, { apps, deployments, events, engine });
 
   // Application-traffic gateway: stable <slug>.localhost:<gwPort> URLs routed
   // to the active deployment. Upstreams come only from deployment state.
@@ -676,6 +679,25 @@ export async function buildApp(opts: BuildAppOptions): Promise<FastifyInstance> 
       throw err;
     }
     return reply.code(204).send();
+  });
+
+  // ---- git auto-deploy (v0.6) -------------------------------------------------
+
+  app.patch('/api/apps/:id/git', async (req, reply) => {
+    const { id } = req.params as { id: string };
+    if (!isValidId(id)) return reply.code(400).send({ error: 'Invalid application id' });
+    const row = await apps.byId(id);
+    if (!row) return reply.code(404).send({ error: 'Application not found' });
+    const body = req.body as { branch?: string; autoDeploy?: boolean };
+    const opts: { branch?: string; autoDeploy?: boolean } = {};
+    if (body.branch !== undefined) {
+      if (!/^[\w.\-/]+$/.test(body.branch)) return reply.code(400).send({ error: 'Invalid branch name' });
+      opts.branch = body.branch;
+    }
+    if (body.autoDeploy !== undefined) opts.autoDeploy = body.autoDeploy === true;
+    await apps.setGitConfig(id, opts);
+    const updated = await apps.byId(id);
+    return { branch: updated!.git_branch, autoDeploy: updated!.auto_deploy };
   });
 
   // ---- volumes & services (v0.5) --------------------------------------------

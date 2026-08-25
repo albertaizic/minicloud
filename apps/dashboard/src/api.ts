@@ -9,6 +9,10 @@ export interface AppDto {
   routeSlug: string | null;
   url: string | null;
   activeDeploymentId: string | null;
+  gitBranch: string;
+  autoDeploy: boolean;
+  lastObservedSha: string | null;
+  lastDeployedSha: string | null;
   restartPolicy: string;
   maxRestartAttempts: number;
   latestDeployment?: {

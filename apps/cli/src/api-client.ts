@@ -47,6 +47,11 @@ export interface AppDto {
   routeSlug: string | null;
   url: string | null;
   activeDeploymentId: string | null;
+  gitBranch: string;
+  autoDeploy: boolean;
+  lastObservedSha: string | null;
+  lastDeployedSha: string | null;
+  lastGitCheck: string | null;
   latestDeployment?: { id: string; status: string; hostPort: number | null; commitSha: string | null } | null;
 }
 
@@ -187,6 +192,13 @@ export const reliabilityApi = {
       ...(maxRestartAttempts !== undefined ? { maxRestartAttempts } : {}),
     }),
   prune: () => request<PruneResultDto>('POST', '/api/prune'),
+  sync: (appId: string) =>
+    request<{ upToDate: boolean; sha?: string; deploymentId?: string | null; message?: string }>(
+      'POST',
+      `/api/apps/${appId}/sync`,
+    ),
+  setGitConfig: (appId: string, opts: { branch?: string; autoDeploy?: boolean }) =>
+    request<void>('PATCH', `/api/apps/${appId}/git`, opts),
   getServices: (deploymentId: string) =>
     request<{ services: Array<{ service: string; status: string; public: boolean; hostPort: number | null; restartCount: number; failureReason: string | null }> }>(
       'GET',

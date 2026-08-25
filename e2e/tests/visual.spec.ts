@@ -6,7 +6,6 @@ const FIX = 'http://127.0.0.1:4555';
 const VIEWPORTS = [
   { name: 'desktop-1440', width: 1440, height: 900 },
   { name: 'laptop-1280', width: 1280, height: 720 },
-  { name: 'mobile-390', width: 390, height: 844 },
 ];
 
 const SHOT_DIR = '../e2e-artifacts/screenshots';

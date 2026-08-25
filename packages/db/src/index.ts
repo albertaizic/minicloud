@@ -87,6 +87,12 @@ export interface ApplicationRow {
   max_restart_attempts: number;
   route_slug: string | null;
   active_deployment_id: string | null;
+  git_branch: string;
+  auto_deploy: boolean;
+  last_observed_sha: string | null;
+  last_deployed_sha: string | null;
+  last_git_check: string | null;
+  webhook_secret: string | null;
 }
 
 export interface DeploymentRow {
@@ -131,14 +137,6 @@ export class AppRepository {
     return res.rows;
   }
 
-  /** Gateway slug lookup (slugs are lowercase; names may not be). */
-  async bySlug(slug: string): Promise<ApplicationRow | null> {
-    const res = await this.db.query<ApplicationRow>(
-      'SELECT * FROM applications WHERE route_slug = $1',
-      [slug],
-    );
-    return res.rows[0] ?? null;
-  }
 
   /**
    * Point the application's traffic at a deployment. The swap is guarded on
@@ -168,6 +166,38 @@ export class AppRepository {
       'UPDATE applications SET active_deployment_id = NULL WHERE id = $1 AND active_deployment_id = $2',
       [applicationId, deploymentId],
     );
+  }
+
+  async setGitConfig(applicationId: string, opts: { branch?: string; autoDeploy?: boolean; webhookSecret?: string | null }): Promise<void> {
+    const sets: string[] = [];
+    const vals: unknown[] = [applicationId];
+    if (opts.branch !== undefined) { vals.push(opts.branch); sets.push(`git_branch = $${vals.length}`); }
+    if (opts.autoDeploy !== undefined) { vals.push(opts.autoDeploy); sets.push(`auto_deploy = $${vals.length}`); }
+    if (opts.webhookSecret !== undefined) { vals.push(opts.webhookSecret); sets.push(`webhook_secret = $${vals.length}`); }
+    if (sets.length === 0) return;
+    await this.db.query(`UPDATE applications SET ${sets.join(', ')} WHERE id = $1`, vals);
+  }
+
+  async setObservedSha(applicationId: string, sha: string): Promise<void> {
+    await this.db.query(
+      'UPDATE applications SET last_observed_sha = $2, last_git_check = now() WHERE id = $1',
+      [applicationId, sha],
+    );
+  }
+
+  async setDeployedSha(applicationId: string, sha: string): Promise<void> {
+    await this.db.query(
+      'UPDATE applications SET last_deployed_sha = $2, last_git_check = now() WHERE id = $1',
+      [applicationId, sha],
+    );
+  }
+
+  async bySlug(slug: string): Promise<ApplicationRow | null> {
+    const res = await this.db.query<ApplicationRow>(
+      'SELECT * FROM applications WHERE route_slug = $1',
+      [slug],
+    );
+    return res.rows[0] ?? null;
   }
 
   /** Update only the restart-policy columns; limits are managed separately. */

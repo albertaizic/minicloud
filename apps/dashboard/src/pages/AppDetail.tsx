@@ -131,6 +131,10 @@ export default function AppDetail() {
       </div>
       {error && <p className="error">{error}</p>}
 
+      <p className="dim">
+        Branch: {data.gitBranch} · Auto-deploy: {data.autoDeploy ? 'ON' : 'OFF'}
+        {data.lastDeployedSha && <> · Deployed: <span className="mono">{data.lastDeployedSha.slice(0, 12)}</span></>}
+      </p>
       <h2>Restart policy</h2>
       <RestartPolicyEditor appId={data.id} initial={{ policy: data.restartPolicy, maxRestartAttempts: data.maxRestartAttempts }} />
 

@@ -564,6 +564,42 @@ async function main(): Promise<void> {
       }
       return;
     }
+    case 'git-status': {
+      const appId = await requireAppId(positional[0] ?? '');
+      const a = (await api.listApps()).find((x) => x.id === appId);
+      if (!a) fail('application not found');
+      const ago = a.lastGitCheck ? `${Math.round((Date.now() - new Date(a.lastGitCheck).getTime()) / 1000)}s ago` : 'never';
+      console.log(`Repository       ${a.repositoryUrl}`);
+      console.log(`Branch           ${a.gitBranch}`);
+      console.log(`Auto deploy      ${a.autoDeploy ? 'enabled' : 'disabled'}`);
+      console.log(`Latest commit    ${a.lastObservedSha?.slice(0, 12) ?? '\u2014'}`);
+      console.log(`Deployed commit  ${a.lastDeployedSha?.slice(0, 12) ?? '\u2014'}`);
+      console.log(`Last checked     ${ago}`);
+      return;
+    }
+    case 'sync': {
+      const appId = await requireAppId(positional[0] ?? '');
+      const result = await reliabilityApi.sync(appId);
+      if (result.upToDate) console.log(`${green('\u2714')} already up to date (${result.sha?.slice(0, 12)})`);
+      else if (result.deploymentId) console.log(`${green('\u2714')} sync queued deployment for ${result.sha?.slice(0, 12)}`);
+      else console.log(dim(result.message ?? 'nothing to do'));
+      return;
+    }
+    case 'auto-deploy': {
+      const appId = await requireAppId(positional[0] ?? '');
+      const setting = positional[1];
+      if (!setting || setting === 'show') {
+        const a = (await api.listApps()).find((x) => x.id === appId);
+        console.log(`auto deploy: ${a?.autoDeploy ? 'enabled' : 'disabled'}`);
+        return;
+      }
+      const on = setting === 'on' || setting === 'enabled';
+      const off = setting === 'off' || setting === 'disabled';
+      if (!on && !off) fail('use on or off');
+      await reliabilityApi.setGitConfig(appId, { autoDeploy: on });
+      console.log(`${green('\u2714')} auto-deploy ${on ? 'enabled' : 'disabled'}`);
+      return;
+    }
     case 'routes': {
       const { gatewayPort, routes } = await reliabilityApi.routes();
       if (routes.length === 0) return console.log('no routes (no application has an active deployment)');
