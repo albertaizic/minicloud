@@ -9,7 +9,7 @@
     "start": "node --experimental-strip-types src/main.ts",
     "build": "tsc -p tsconfig.build.json",
     "typecheck": "tsc --noEmit",
-    "test": "vitest run --exclude '**/*.integration.test.ts'",
+    "test": "vitest run --exclude \"**/*.integration.test.ts\"",
     "test:integration": "vitest run src/pipeline.integration.test.ts src/config.integration.test.ts src/reliability.integration.test.ts src/routing.integration.test.ts src/multiservice.integration.test.ts",
     "test:unit": "npm test"
   },

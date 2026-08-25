@@ -10,7 +10,7 @@
   },
   "scripts": {
     "typecheck": "tsc --noEmit",
-    "test": "vitest run --exclude '**/*.integration.test.ts'",
+    "test": "vitest run --exclude \"**/*.integration.test.ts\"",
     "test:unit": "npm test"
   },
   "devDependencies": {
