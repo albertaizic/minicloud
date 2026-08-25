@@ -86,6 +86,8 @@ export default function AppDetail() {
     } catch (e) { setError((e as Error).message); }
   };
 
+  const [confirmForceStop, setConfirmForceStop] = useState(false);
+
   if (!data && !error) return <p>Loading…</p>;
   if (error) return <p className="error">{error} — <button onClick={load}>retry</button></p>;
   if (!data) return null;
@@ -104,11 +106,25 @@ export default function AppDetail() {
     <div>
       <h1>{data.name}</h1>
       <p className="dim mono">{data.repositoryUrl}</p>
+      <p>
+        Stable URL:{' '}
+        {data.url
+          ? <a href={data.url} target="_blank" rel="noreferrer" className="mono">{data.url}</a>
+          : <span className="dim">no active deployment</span>}
+      </p>
       <div className="actions">
         <button className="primary" onClick={deployAgain}>Deploy again</button>
         {latest && (
           <>
-            <button onClick={() => act(() => api.stop(latest.id))}>Stop latest</button>
+            {confirmForceStop ? (
+              <>
+                <span className="error-text">Stopping the ACTIVE deployment makes {data.name} unavailable. </span>
+                <button className="primary" onClick={() => act(() => api.stop(latest.id, { force: true })).then(() => setConfirmForceStop(false))}>Confirm force stop</button>
+                <button onClick={() => setConfirmForceStop(false)}>Cancel</button>
+              </>
+            ) : (
+              <button onClick={() => (latest!.isActive ? setConfirmForceStop(true) : act(() => api.stop(latest!.id, { force: true })))}>Stop latest</button>
+            )}
             <button onClick={() => act(() => api.restart(latest.id))}>Restart latest</button>
           </>
         )}
@@ -130,7 +146,7 @@ export default function AppDetail() {
           {data.deployments.map((d) => (
             <tr key={d.id}>
               <td><Link to={`/deployments/${d.id}`} className="mono">{d.id.slice(0, 8)}</Link></td>
-              <td><StatusBadge status={d.status} /></td>
+              <td><StatusBadge status={d.status} />{d.isActive && <strong> ACTIVE</strong>}</td>
               <td className="mono dim">
                 {d.commitSha?.slice(0, 7) ?? '—'}
                 {d.rollbackOf ? <span title={`rollback of ${d.rollbackOf.slice(0, 8)}`}> ↩</span> : null}

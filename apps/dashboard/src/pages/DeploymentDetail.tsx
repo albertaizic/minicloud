@@ -42,14 +42,17 @@ export default function DeploymentDetail() {
   return (
     <div>
       <p><Link to="/">← Overview</Link>{appName && <> · <Link to={`/apps/${dep.applicationId}`}>{appName}</Link></>}</p>
-      <h1>Deployment <span className="mono">{dep.id.slice(0, 8)}</span></h1>
+      <h1>
+        Deployment <span className="mono">{dep.id.slice(0, 8)}</span>
+        {dep.isActive && <strong> ACTIVE</strong>}
+      </h1>
       <div className="detail-grid">
         <div><StatusBadge status={dep.status} /></div>
         <dl>
           <dt>Commit</dt><dd className="mono">{dep.commitSha?.slice(0, 12) ?? '—'}</dd>
           <dt>Ref</dt><dd className="mono">{dep.ref ?? '—'}</dd>
           <dt>Container</dt><dd className="mono">{dep.containerName ?? '—'}</dd>
-          <dt>URL</dt>
+          <dt>Container URL</dt>
           <dd>{dep.url
             ? <a href={dep.url} target="_blank" rel="noreferrer">{dep.url}</a>
             : <span className="dim">not serving</span>}</dd>

@@ -6,6 +6,9 @@ export interface AppDto {
   name: string;
   repositoryUrl: string;
   createdAt: string;
+  routeSlug: string | null;
+  url: string | null;
+  activeDeploymentId: string | null;
   restartPolicy: string;
   maxRestartAttempts: number;
   latestDeployment?: {
@@ -47,6 +50,7 @@ export interface DeploymentDto {
   restartCount: number;
   autoRestartCount: number;
   rollbackOf: string | null;
+  isActive: boolean;
   config: ConfigSnapshotDto | null;
   createdAt: string;
   startedAt: string | null;
@@ -96,7 +100,8 @@ export const api = {
     req<AppDto>('/api/apps', { method: 'POST', body: JSON.stringify({ name, repositoryUrl }) }),
   deploy: (appId: string) => req<{ deployment: DeploymentDto }>(`/api/apps/${appId}/deploy`, { method: 'POST', body: '{}' }),
   getDeployment: (id: string) => req<DeploymentDto>(`/api/deployments/${id}`),
-  stop: (id: string) => req<DeploymentDto>(`/api/deployments/${id}/stop`, { method: 'POST' }),
+  stop: (id: string, opts: { force?: boolean } = {}) =>
+    req<DeploymentDto>(`/api/deployments/${id}/stop${opts.force ? '?force=true' : ''}`, { method: 'POST' }),
   restart: (id: string) => req<DeploymentDto>(`/api/deployments/${id}/restart`, { method: 'POST' }),
   rollback: (appId: string, targetDeploymentId: string) =>
     req<{ deployment: DeploymentDto }>(`/api/apps/${appId}/rollback`, {
@@ -108,6 +113,19 @@ export const api = {
   getMetrics: (id: string) => req<MetricsDto>(`/api/deployments/${id}/metrics`),
   getRestartPolicy: (appId: string) =>
     req<RestartPolicyDto>(`/api/apps/${appId}/restart-policy`),
+  getRoutes: () =>
+    req<{
+      gatewayPort: number;
+      routes: Array<{
+        slug: string;
+        url: string;
+        appName: string | null;
+        deploymentId: string;
+        upstream: { host: string; port: number };
+        activeSince: string;
+        stats: { requests: number; active: number; ok2xx: number; client4xx: number; server5xx: number };
+      }>;
+    }>('/api/routes'),
   setRestartPolicy: (appId: string, policy: string, maxRestartAttempts?: number) =>
     req<RestartPolicyDto>(`/api/apps/${appId}/restart-policy`, {
       method: 'PUT',

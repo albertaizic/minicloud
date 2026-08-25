@@ -44,6 +44,9 @@ export interface AppDto {
   name: string;
   repositoryUrl: string;
   createdAt: string;
+  routeSlug: string | null;
+  url: string | null;
+  activeDeploymentId: string | null;
   latestDeployment?: { id: string; status: string; hostPort: number | null; commitSha: string | null } | null;
 }
 
@@ -117,9 +120,11 @@ export const api = {
     request<{ deployment: DeploymentDto }>('POST', `/api/apps/${appId}/deploy`, opts.ref ? { ref: opts.ref } : {}),
   listDeployments: () => request<DeploymentDto[]>('GET', '/api/deployments'),
   getDeployment: (id: string) => request<DeploymentDto>('GET', `/api/deployments/${id}`),
-  stop: (id: string) => request<DeploymentDto>('POST', `/api/deployments/${id}/stop`),
+  stop: (id: string, opts: { force?: boolean } = {}) =>
+    request<DeploymentDto>('POST', `/api/deployments/${id}/stop${opts.force ? '?force=true' : ''}`),
   restart: (id: string) => request<DeploymentDto>('POST', `/api/deployments/${id}/restart`),
-  deleteDeployment: (id: string) => request<void>('DELETE', `/api/deployments/${id}`),
+  deleteDeployment: (id: string, opts: { force?: boolean } = {}) =>
+    request<void>('DELETE', `/api/deployments/${id}${opts.force ? '?force=true' : ''}`),
   logs: (id: string) =>
     request<{ logs?: { message: string }[]; message?: string }>('GET', `/api/deployments/${id}/logs`),
   streamLogs: (id: string, onLine: (line: string) => void): Promise<() => void> => {
@@ -182,6 +187,19 @@ export const reliabilityApi = {
       ...(maxRestartAttempts !== undefined ? { maxRestartAttempts } : {}),
     }),
   prune: () => request<PruneResultDto>('POST', '/api/prune'),
+  routes: () =>
+    request<{
+      gatewayPort: number;
+      routes: Array<{
+        slug: string;
+        url: string;
+        appName: string | null;
+        deploymentId: string;
+        upstream: { host: string; port: number };
+        activeSince: string;
+        stats: { requests: number; active: number; ok2xx: number; client4xx: number; server5xx: number };
+      }>;
+    }>('GET', '/api/routes'),
 };
 
 // ---- application configuration (env / secrets / limits) --------------------

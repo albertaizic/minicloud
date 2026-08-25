@@ -48,7 +48,7 @@ export default function Overview() {
       {apps && apps.length === 0 && <p className="empty">No applications yet. Create one above or use the CLI: <code>minicloud deploy https://github.com/…</code></p>}
       <table className="table">
         <thead>
-          <tr><th>App</th><th>Repository</th><th>Latest deployment</th><th>Status</th><th>URL</th></tr>
+          <tr><th>App</th><th>Repository</th><th>Latest deployment</th><th>Status</th><th>Stable URL</th><th>Internal</th></tr>
         </thead>
         <tbody>
           {(apps ?? []).map((a) => (
@@ -57,7 +57,8 @@ export default function Overview() {
               <td className="mono dim">{a.repositoryUrl}</td>
               <td>{a.latestDeployment ? <Link to={`/deployments/${a.latestDeployment.id}`} className="mono">{a.latestDeployment.id.slice(0, 8)}</Link> : <span className="dim">—</span>}</td>
               <td>{a.latestDeployment ? <StatusBadge status={a.latestDeployment.status} /> : <span className="dim">never deployed</span>}</td>
-              <td>{a.latestDeployment?.hostPort ? <a href={`http://localhost:${a.latestDeployment.hostPort}`} target="_blank" rel="noreferrer">:{a.latestDeployment.hostPort}</a> : <span className="dim">—</span>}</td>
+              <td>{a.url ? <a href={a.url} target="_blank" rel="noreferrer" className="mono">{a.url}</a> : <span className="dim">no active deployment</span>}</td>
+              <td>{a.latestDeployment?.hostPort ? <span className="mono dim">:{a.latestDeployment.hostPort}</span> : <span className="dim">—</span>}</td>
             </tr>
           ))}
         </tbody>

@@ -45,6 +45,10 @@ Reliability & observability:
                                          Show or set restart policy (disabled|on-failure)
   minicloud prune [--yes]                Remove stopped containers, unreferenced
                                          MiniCloud images, stale workspaces
+  minicloud routes                       Show gateway routing table
+
+Stable app URLs: http://<app>.localhost:<gateway-port> routes to whichever
+deployment is active. stop/delete of the ACTIVE deployment requires --force.
   minicloud env set <app> KEY=VALUE      Create or update an env var
   minicloud env delete <app> KEY         Remove an env var or secret entry
   minicloud secret set <app> KEY [value] Store a secret; value is prompted
@@ -371,11 +375,22 @@ async function main(): Promise<void> {
     case 'apps': {
       const apps = await api.listApps();
       if (apps.length === 0) return console.log('no applications yet — try: minicloud deploy <git-url>');
-      console.log(bold('NAME'.padEnd(20)) + dim('ID'.padEnd(12)) + 'LATEST DEPLOYMENT');
+      console.log(
+        bold('NAME'.padEnd(20)) +
+        'STATUS'.padEnd(12) +
+        'ACTIVE'.padEnd(12) +
+        'URL',
+      );
       for (const a of apps) {
         const latest = a.latestDeployment;
-        const latestStr = latest ? `${statusColor(latest.status).padEnd(18)} ${dim(short(latest.id))} ${latest.hostPort ? dim(`:${latest.hostPort}`) : ''}` : dim('—');
-        console.log(a.name.padEnd(20) + short(a.id).padEnd(12) + latestStr);
+        const status = latest ? statusColor(latest.status) : dim('—');
+        const active = a.activeDeploymentId ? short(a.activeDeploymentId) : dim('—');
+        console.log(
+          a.name.padEnd(20) +
+          status.padEnd(20) +
+          String(active).padEnd(12) +
+          (a.url ? cyan(a.url) : dim('no route')),
+        );
       }
       return;
     }
@@ -418,7 +433,7 @@ async function main(): Promise<void> {
       return;
     case 'stop': {
       const id = await deploymentIdArg(positional[0] ?? '');
-      const d = await api.stop(id);
+      const d = await api.stop(id, { force: flags.force === 'true' });
       console.log(`${yellow('■')} deployment ${short(d.id)} ${d.status}`);
       return;
     }
@@ -436,7 +451,7 @@ async function main(): Promise<void> {
     }
     case 'delete': {
       const id = await deploymentIdArg(positional[0] ?? '');
-      await api.deleteDeployment(id);
+      await api.deleteDeployment(id, { force: flags.force === 'true' });
       console.log(`deleted deployment ${short(id)}`);
       return;
     }
@@ -522,6 +537,20 @@ async function main(): Promise<void> {
     case 'prune':
       await cmdPrune(flags.yes === 'true');
       return;
+    case 'routes': {
+      const { gatewayPort, routes } = await reliabilityApi.routes();
+      if (routes.length === 0) return console.log('no routes (no application has an active deployment)');
+      console.log(bold(`GATEWAY :${gatewayPort}`));
+      for (const r of routes) {
+        const s2 = r.stats;
+        console.log(
+          cyan(r.url.padEnd(46)) +
+          short(r.deploymentId).padEnd(12) +
+          dim(`reqs ${s2.requests} · active ${s2.active} · 2xx ${s2.ok2xx} · 4xx ${s2.client4xx} · 5xx ${s2.server5xx}`),
+        );
+      }
+      return;
+    }
     default:
       help();
       process.exitCode = 1;
