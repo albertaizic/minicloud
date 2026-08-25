@@ -1,0 +1,38 @@
+version: 1
+
+services:
+  web:
+    dockerfile: web/Dockerfile
+    context: web
+    port: 3000
+    public: true
+    health:
+      path: /health
+    depends_on:
+      - api
+
+  api:
+    dockerfile: api/Dockerfile
+    context: api
+    port: 4000
+    public: false
+    health:
+      path: /health
+    resources:
+      memory_mb: 128
+      cpus: 0.25
+    volumes:
+      - app-data:/data
+
+  worker:
+    dockerfile: worker/Dockerfile
+    context: worker
+    public: false
+    restart: on-failure
+    max_restart_attempts: 3
+    depends_on:
+      - api
+
+volumes:
+  app-data:
+    driver: local
