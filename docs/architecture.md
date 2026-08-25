@@ -109,6 +109,48 @@ a CHECK-constrained status enum, migrated by `packages/db`'s runner. Ephemeral
 runtime objects (containers, images) are always reconcilable from Docker;
 durable history lives only in PostgreSQL.
 
+### Gateway, stable URLs and zero-downtime cutover (v0.4)
+
+An in-process reverse proxy (`packages/gateway`) listens on `GATEWAY_PORT`
+(default 8080) and routes `http://<slug>.localhost:<port>` to the ACTIVE
+deployment of that application. Routing decisions come exclusively from the
+gateway's route table, which the engine fills from deployment state — request
+input can never select an upstream (no SSRF surface).
+
+```mermaid
+sequenceDiagram
+    participant API as API/engine
+    participant DB as PostgreSQL
+    participant GW as Gateway :8080
+    participant OLD as Deployment A
+    participant NEW as Deployment B
+    API->>DB: create deployment B (QUEUED)
+    Note over OLD: keeps serving traffic
+    NEW->>NEW: clone/build/start/health-check
+    API->>API: app lock + guarded swap<br/>(WHERE active = A)
+    API->>DB: active_deployment_id = B
+    API->>GW: setRoute(slug → B)
+    GW->>GW: verify through gateway
+    API-->>GW: events cutover_completed
+    API->>OLD: drain in-flight → stop → STOPPED
+```
+
+Guards:
+
+- Cutover runs under a per-application lock and a guarded SQL swap
+  (`WHERE active_deployment_id IS NOT DISTINCT FROM <expected>`): a deployment
+  that finished after being superseded retires itself instead of stealing
+  traffic.
+- Gateway verification happens through the gateway itself; failure reverts the
+  swap and the route, and the previous version keeps serving.
+- The active deployment's restart lands on a new port → the engine updates the
+  route and verifies it (`gateway.route_updated`).
+- Terminal crash / forced stop / forced delete of the active deployment clears
+  the route (honest 503); automatic recovery re-points it on success.
+- Startup reconciliation rebuilds the whole route table from
+  `applications.active_deployment_id`, validates containers, clears stale
+  pointers, and retires stale RUNNING deployments that are not active.
+
 ### Deployment events (v0.3)
 
 Every lifecycle transition is persisted to `deployment_events` (migration 003):

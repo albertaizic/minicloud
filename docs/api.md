@@ -1,4 +1,4 @@
-# API & CLI reference (v0.3)
+# API & CLI reference (v0.4)
 
 Base URL: `http://localhost:4000` (`PORT` / `HOST` in `.env`).
 All bodies are JSON; validation failures return `400` with
@@ -257,3 +257,55 @@ The deployment page shows status/URL/commit/rollback origin, live **metrics**
 (CPU, memory, uptime, restarts — polled every 3s only while RUNNING, timers
 cleaned up on navigation), the **event timeline**, the configuration snapshot,
 and logs.
+
+
+## Stable URLs, routing and zero-downtime deploys (v0.4)
+
+Every application has a stable endpoint `http://<slug>.localhost:<gateway-port>`
+(slug = lowercased app name; gateway port defaults to 8080). The application
+serialization carries it:
+
+```json
+{
+  "routeSlug": "my-api",
+  "url": "http://my-api.localhost:8080",
+  "activeDeploymentId": "..."
+}
+```
+
+Deployment serialization carries `isActive` (true for the deployment currently
+receiving traffic).
+
+### Routing table
+
+```
+GET /api/routes
+200 {
+  "gatewayPort": 8080,
+  "routes": [ { "slug": "my-api", "url": "...", "appId": "...", "appName": "my-api",
+                "deploymentId": "...", "upstream": {"host": "127.0.0.1", "port": 33421},
+                "activeSince": "...", "stats": {"requests": 120, "active": 0,
+                "ok2xx": 118, "client4xx": 2, "server5xx": 0} } ]
+}
+```
+
+### Zero-downtime semantics
+
+- A new deployment only becomes active after its health check passes AND the
+  gateway verifies the route end-to-end (`traffic.cutover_started/completed`
+  events; `traffic.cutover_failed` reverts to the previous version).
+- The previous active deployment drains (bounded wait for in-flight requests)
+  and is retired; its history is preserved.
+- Rollback uses the same cutover: the stable URL never changes.
+- `stop`/`delete` of the ACTIVE deployment returns **409** unless forced with
+  `?force=true` (query) or `{"force": true}` (body). Forcing takes the app
+  offline (503) until the next deployment becomes active.
+
+### CLI
+
+```
+minicloud apps        # NAME / STATUS / ACTIVE / URL columns
+minicloud routes      # gateway routing table with request counters
+minicloud stop <id> --force     # required when <id> is the active deployment
+minicloud delete <id> --force
+```

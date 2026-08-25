@@ -5,6 +5,24 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and the project adheres to [Semantic Versioning](https://semver.org).
 
 
+## [Unreleased] — v0.4 routing & zero-downtime deployments
+
+### Added
+
+- **MiniCloud gateway**: in-process reverse proxy giving every application a stable URL `http://<app>.localhost:<gateway-port>` (default 8080); hostname-based routing, streaming bodies, WebSocket upgrades, forwarding headers set from the real connection, hop-by-hop header stripping, bounded per-route request counters
+- **Active deployment model**: `applications.active_deployment_id` + `route_slug` (migration 004, backfilled); exactly one active deployment per app, validated during startup reconciliation
+- **Zero-downtime cutover**: replacements build/health-check while the old version serves; traffic switches atomically only after gateway verification; failed cutovers revert; superseded deployments retire themselves instead of stealing traffic
+- **Drain & retire**: bounded wait for in-flight requests, then old containers are stopped (records, logs, events, images preserved)
+- **Rollback integration**: same stable URL before and after; traffic events cover requested → ready → switched → retired
+- **Crash-recovery routing**: active-deployment crashes produce honest 503s, recovery re-points the gateway automatically; non-active deployments never affect routing
+- **Explicit outage semantics**: stop/delete of the ACTIVE deployment returns 409 unless forced (`?force=true` / `{"force": true}`)
+- **Observability**: `GET /api/routes`, `minicloud routes`, stable URL + active deployment in `minicloud apps` and the dashboard (ACTIVE badges, stable URL banners, force-stop confirmation)
+- Startup reconciliation rebuilds the routing table from persisted state and retires stale non-active RUNNING deployments
+
+### Changed
+
+- Deployments no longer need their random host port for normal traffic; it remains visible as diagnostic information
+
 ## [Unreleased] — v0.3 reliability & observability
 
 ### Added

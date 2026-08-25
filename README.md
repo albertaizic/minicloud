@@ -16,11 +16,14 @@ the Render/Heroku/Railway/Fly.io developer experience, running locally.
 
 ---
 
-MiniCloud turns a repository into a running, health-checked container:
+MiniCloud turns a repository into a running, health-checked container with a **stable URL per application**:
 
 ```bash
 minicloud deploy https://github.com/example/my-api
 # ✔ deployment is RUNNING at http://localhost:31542
+#
+# and permanently available at the stable app URL:
+#   http://my-api.localhost:8080   <- survives every redeploy, rollback and restart
 ```
 
 It clones your repo, builds the Dockerfile, starts an isolated container on a
@@ -55,6 +58,7 @@ solve, at an understandable scale.
 - **Rollback**: roll an application back to any previous successful deployment — creates a NEW deployment (history stays immutable), reuses the old image when available, rebuilds from the recorded commit otherwise
 - **Automatic restart policy**: `disabled` or `on-failure` with a bounded attempt budget (0–10) and capped exponential backoff; manual stop/restart resets the budget and suppresses recovery
 - **Runtime metrics**: live CPU %, memory used/limit, uptime and restart counts per deployment via Docker stats
+- **Stable URLs + zero-downtime deploys (v0.4)**: every application gets `http://<app>.localhost:<gateway-port>`; replacements build and health-check in parallel, then traffic switches atomically — the old version keeps serving until the new one is verified
 - **REST API + CLI + web dashboard**
 - **PostgreSQL persistence** with migrations
 
@@ -174,6 +178,9 @@ minicloud rollback <app> <deployment-id>    # roll back to a previous revision
 minicloud restart-policy <app> [disabled|on-failure] [--max N]
 minicloud prune [--yes]                     # remove stopped containers, unreferenced
                                             # MiniCloud images, stale workspaces
+minicloud routes                            # gateway routing table + counters
+
+# stop/delete of the ACTIVE deployment requires --force (explicit outage)
 ```
 
 ## API overview
@@ -236,6 +243,36 @@ npm run build          # production builds
   Docker + PostgreSQL; exercise the real pipeline, env injection, cgroup
   limits (incl. OOM), events, rollback (image reuse + rebuild), automatic
   restart/retry exhaustion, metrics and reconciliation.
+
+## Stable URLs and zero-downtime deploys (v0.4)
+
+Each application owns `http://<app-slug>.localhost:<GATEWAY_PORT>` (default
+gateway port 8080). `.localhost` domains resolve to `127.0.0.1` on all current
+browsers, Node and Windows 11 — no hosts-file editing required.
+
+Replacement sequence (deploy or rollback):
+
+```mermaid
+sequenceDiagram
+    participant U as Users
+    participant G as Gateway
+    participant A as Deployment A (active)
+    participant B as Deployment B (building)
+    U->>G: requests → A
+    B->>B: clone → build → start → health check
+    Note over A: keeps serving the whole time
+    B->>G: cutover (guarded swap)
+    G->>B: verify through gateway
+    G->>U: requests → B
+    G->>A: drain in-flight, then retire
+```
+
+- If B fails at any stage, A stays active and serving; nothing changes.
+- The old deployment drains (in-flight requests finish, bounded wait) and is
+  then retired; its record, logs, events and image are preserved.
+- Rollback uses the identical path: same stable URL, version flips back.
+- Stopping or deleting the ACTIVE deployment requires `--force` (explicit,
+  confirmed outage — MiniCloud never silently reroutes traffic).
 
 ## Docker resource retention
 

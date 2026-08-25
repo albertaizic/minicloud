@@ -123,3 +123,30 @@ MiniCloud is a **single-user, local development PaaS**. We assume:
 | Cross-kind overwrite | rejected `409` (delete first) |
 | Unknown payload fields | rejected (`strict()` schemas) |
 | IDs in URLs | UUID-validated before DB access |
+
+
+## Gateway and traffic routing (v0.4)
+
+- **No SSRF surface by construction**: upstream `host:port` pairs originate
+  only from MiniCloud deployment rows; no request input is ever used to choose
+  a destination. The gateway proxies solely to 127.0.0.1 ports of
+  MiniCloud-managed containers.
+- **Host validation**: requests must arrive with `Host: <slug>.localhost`
+  (optionally `:port`); slugs are strictly `[a-z0-9][a-z0-9-]{0,62}`. Anything
+  else — including `app.evil.com`, bare `localhost`, or oversized slugs — is
+  rejected with 404 and never proxied.
+- **Forwarding headers**: inbound `X-Forwarded-For/Proto/Host` are stripped and
+  re-set from the actual connection, so clients cannot forge a proxy chain.
+- **Hop-by-hop headers** (and headers named by `Connection:`) are stripped in
+  both directions — this also removes the classic request-smuggling vectors
+  that rely on conflicting framing headers. Bodies stream unbuffered.
+- **Upgrades**: WebSocket upgrades are answered only when the upstream accepts
+  them; both sockets are torn down together on error/close.
+- **Failure honesty**: unknown host → 404; known app without active deployment
+  → 503; unreachable container → 502. The gateway never reports success before
+  a route is verified (`traffic.cutover_failed` reverts unverified switches).
+- **Limitations**: this is a local, unauthenticated development gateway. It does
+  not terminate TLS, rate-limit, or authenticate applications; anyone who can
+  reach the gateway port can reach any active app. Header-based routing means
+  any HTTP client on the machine can address any app by setting the Host
+  header — the same trust boundary as the rest of MiniCloud.
