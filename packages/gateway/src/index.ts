@@ -307,7 +307,14 @@ export class Gateway {
       headers: { ...headers, upgrade: 'websocket', connection: 'Upgrade' },
     });
     upstream.on('upgrade', (upstreamRes, upstreamSocket, upstreamHead) => {
-      const resHeaders = stripHopByHop(upstreamRes.headers, connectionNamedHeaders(upstreamRes));
+      // 101 Switching Protocols responses MUST include Upgrade and Connection
+      // headers (RFC 7230 §6.7). Hop-by-hop stripping applies only to normal
+      // proxied responses, not to the upgrade handshake itself.
+      const resHeaders: http.OutgoingHttpHeaders = {};
+      for (const [name, value] of Object.entries(upstreamRes.headers)) {
+        if (value === undefined) continue;
+        resHeaders[name] = value;
+      }
       const lines = [`HTTP/1.1 ${upstreamRes.statusCode} ${upstreamRes.statusMessage ?? ''}`];
       for (const [name, value] of Object.entries(resHeaders)) {
         if (value === undefined) continue;
