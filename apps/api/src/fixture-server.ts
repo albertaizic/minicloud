@@ -36,16 +36,22 @@ export async function startFixtureServer(specs: FixtureSpec[]): Promise<FixtureS
     await run('git', ['clone', '-q', bare, work]);
     const commitShas: string[] = [];
     for (const revision of revisions) {
-      const files = await fsp.readdir(path.join(repoRoot, revision));
-      for (const f of files) {
-        const dest = path.join(work, f);
-        await fsp.copyFile(path.join(repoRoot, revision, f), dest);
-        // Windows CopyFileW preserves the source mtime; an older mtime than
-        // the git index makes `git add` skip re-hashing (racy-git heuristic),
-        // so identical-size changes are missed. Normalize to now.
-        const now = new Date();
-        await fsp.utimes(dest, now, now);
-      }
+      // Recursive copy: fixtures may contain subdirectories (multi-service).
+      const copyDir = async (src: string, dest: string): Promise<void> => {
+        await fsp.mkdir(dest, { recursive: true });
+        for (const entry of await fsp.readdir(src, { withFileTypes: true })) {
+          const srcPath = path.join(src, entry.name);
+          const destPath = path.join(dest, entry.name);
+          if (entry.isDirectory()) await copyDir(srcPath, destPath);
+          else await fsp.copyFile(srcPath, destPath);
+          // Windows CopyFileW preserves the source mtime; an older mtime than
+          // the git index makes `git add` skip re-hashing (racy-git
+          // heuristic), so identical-size changes are missed. Normalize now.
+          const now = new Date();
+          await fsp.utimes(destPath, now, now);
+        }
+      };
+      await copyDir(path.join(repoRoot, revision), work);
       await run('git', ['add', '-A'], { cwd: work });
       await run(
         'git',

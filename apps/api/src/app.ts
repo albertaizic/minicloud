@@ -7,8 +7,11 @@ import {
   DeploymentRepository,
   AppConfigRepository,
   DeploymentEventRepository,
+  DeploymentServiceRepository,
+  ApplicationVolumeRepository,
   type ApplicationRow,
   type DeploymentRow,
+  type DeploymentServiceRow,
 } from '@minicloud/db';
 import {
   DeploymentEngine,
@@ -73,7 +76,7 @@ function serializeSnapshot(raw: Record<string, unknown> | null): DeploymentConfi
   return snap;
 }
 
-function serializeDeployment(row: DeploymentRow, opts: { isActive?: boolean } = {}) {
+function serializeDeployment(row: DeploymentRow, opts: { isActive?: boolean; services?: unknown[] } = {}) {
   return {
     id: row.id,
     applicationId: row.application_id,
@@ -91,6 +94,8 @@ function serializeDeployment(row: DeploymentRow, opts: { isActive?: boolean } = 
     restartCount: row.restart_count,
     autoRestartCount: row.auto_restart_count,
     rollbackOf: row.rollback_of_deployment_id,
+    multiService: row.manifest_snapshot !== null,
+    services: opts.services ?? null,
     config: serializeSnapshot(row.config_snapshot),
     createdAt: row.created_at,
     startedAt: row.started_at,
@@ -98,6 +103,27 @@ function serializeDeployment(row: DeploymentRow, opts: { isActive?: boolean } = 
     url: row.status === 'RUNNING' && row.host_port ? `http://localhost:${row.host_port}` : null,
   };
 }
+
+
+function serializeServiceRow(row: DeploymentServiceRow) {
+  return {
+    service: row.service_name,
+    status: row.status,
+    isActive: undefined,
+    public: row.public_service,
+    containerId: row.container_id,
+    containerName: row.container_name,
+    hostPort: row.host_port,
+    containerPort: row.container_port,
+    healthPath: row.health_path,
+    restartCount: row.restart_count,
+    autoRestartCount: row.auto_restart_count,
+    failureReason: row.failure_reason,
+    exitCode: row.exit_code,
+  };
+}
+
+
 
 export async function buildApp(opts: BuildAppOptions): Promise<FastifyInstance> {
   const app = Fastify({
@@ -117,6 +143,11 @@ export async function buildApp(opts: BuildAppOptions): Promise<FastifyInstance> 
   const deployments = new DeploymentRepository(db);
   const appConfig = new AppConfigRepository(db);
   const events = new DeploymentEventRepository(db);
+  const services = new DeploymentServiceRepository(db);
+  const volumes = new ApplicationVolumeRepository(db);
+
+  const servicesFor = async (deploymentId: string) =>
+    (await services.listByDeployment(deploymentId)).map(serializeServiceRow);
 
   // Application-traffic gateway: stable <slug>.localhost:<gwPort> URLs routed
   // to the active deployment. Upstreams come only from deployment state.
@@ -529,7 +560,14 @@ export async function buildApp(opts: BuildAppOptions): Promise<FastifyInstance> 
     const deps = await deployments.listByApp(id);
     return {
       ...serializeApp(row, gwPort),
-      deployments: deps.map((d) => serializeDeployment(d, { isActive: row.active_deployment_id === d.id })),
+      deployments: await Promise.all(
+        deps.map(async (d) =>
+          serializeDeployment(d, {
+            isActive: row.active_deployment_id === d.id,
+            services: d.manifest_snapshot ? await servicesFor(d.id) : undefined,
+          }),
+        ),
+      ),
     };
   });
 
@@ -566,7 +604,11 @@ export async function buildApp(opts: BuildAppOptions): Promise<FastifyInstance> 
     if (!isValidId(id)) return reply.code(400).send({ error: 'Invalid deployment id' });
     const row = await deployments.byId(id);
     if (!row) return reply.code(404).send({ error: 'Deployment not found' });
-    return serializeDeployment(row);
+    const appRow = await apps.byId(row.application_id);
+    return serializeDeployment(row, {
+      isActive: appRow?.active_deployment_id === row.id,
+      services: row.manifest_snapshot ? await servicesFor(id) : undefined,
+    });
   });
 
   app.post('/api/deployments/:id/restart', async (req, reply) => {
@@ -636,7 +678,52 @@ export async function buildApp(opts: BuildAppOptions): Promise<FastifyInstance> 
     return reply.code(204).send();
   });
 
+  // ---- volumes & services (v0.5) --------------------------------------------
+
+  app.get('/api/apps/:id/volumes', async (req, reply) => {
+    const { id } = req.params as { id: string };
+    if (!isValidId(id)) return reply.code(400).send({ error: 'Invalid application id' });
+    const row = await apps.byId(id);
+    if (!row) return reply.code(404).send({ error: 'Application not found' });
+    const vols = await volumes.listByApplication(id);
+    return {
+      applicationId: id,
+      volumes: vols.map((v) => ({
+        name: v.volume_name,
+        dockerVolume: v.docker_volume,
+        createdAt: v.created_at,
+      })),
+      note: 'Volumes persist across deployments and rollbacks. Deleting the application does NOT delete volumes unless ?volumes=true.',
+    };
+  });
+
+  app.delete('/api/apps/:id/volumes', async (req, reply) => {
+    // Destructive: requires explicit confirmation via ?confirm=true.
+    const { id } = req.params as { id: string };
+    if (!isValidId(id)) return reply.code(400).send({ error: 'Invalid application id' });
+    if ((req.query as { confirm?: string }).confirm !== 'true') {
+      return reply.code(409).send({
+        error: 'Volume deletion is destructive and irreversible. Repeat with ?confirm=true.',
+      });
+    }
+    const removed = await engine.removeApplicationVolumes(id);
+    req.log.warn({ appId: id, removed }, 'application volumes DELETED');
+    return reply.code(200).send({ removed });
+  });
+
+  app.get('/api/deployments/:id/services', async (req, reply) => {
+    const { id } = req.params as { id: string };
+    if (!isValidId(id)) return reply.code(400).send({ error: 'Invalid deployment id' });
+    const row = await deployments.byId(id);
+    if (!row) return reply.code(404).send({ error: 'Deployment not found' });
+    if (!row.manifest_snapshot) {
+      return reply.code(409).send({ error: 'This deployment is single-service (no manifest)' });
+    }
+    return { deploymentId: id, services: await servicesFor(id) };
+  });
+
   app.get('/api/deployments/:id/logs', async (req, reply) => {
+
     const { id } = req.params as { id: string };
     if (!isValidId(id)) return reply.code(400).send({ error: 'Invalid deployment id' });
     const row = await deployments.byId(id);

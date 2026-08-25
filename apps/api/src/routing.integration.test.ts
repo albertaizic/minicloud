@@ -15,6 +15,7 @@ beforeAll(async () => {
   ctx = await createTestApp();
   fixtures = await startFixtureServer([
     { name: 'rev-app', revisions: ['rev-app-a', 'rev-app-b'] },
+    { name: 'msvc', revisions: ['msvc-a', 'msvc-b'] },
     'failing-app',
     'crash-once',
   ]);
