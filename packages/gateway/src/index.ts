@@ -47,13 +47,20 @@ const HOP_BY_HOP = new Set([
 
 export const SLUG_RE = /^[a-z0-9][a-z0-9-]{0,62}$/;
 
-/** Parse a Host header into a slug, or null when it is not a gateway host. */
+/**
+ * Parse a Host header into a route key, or null when it is not a gateway host.
+ * Route keys are dot-separated labels: `app.localhost` -> `app` (the
+ * application's primary public service) and `api.app.localhost` -> `api.app`
+ * (a specific public service). Max three labels; every label is validated.
+ */
 export function slugFromHost(hostHeader: string | undefined): string | null {
   if (!hostHeader) return null;
   const host = hostHeader.toLowerCase().split(':')[0]!;
   if (!host.endsWith('.localhost')) return null;
-  const slug = host.slice(0, -'.localhost'.length);
-  return SLUG_RE.test(slug) ? slug : null;
+  const key = host.slice(0, -'.localhost'.length);
+  const labels = key.split('.');
+  if (labels.length < 1 || labels.length > 3) return null;
+  return labels.every((l) => SLUG_RE.test(l)) ? key : null;
 }
 
 function emptyStats(): RouteStats {
@@ -184,10 +191,13 @@ export class Gateway {
         const req = http.request(
           { host: this.host, port: this.port, path, headers: { host: `${slug}.localhost` }, timeout: timeoutMs },
           (res) => {
-            // Any real HTTP response proves the ROUTE works; app-level health
-            // is the deployment health check's concern (it accepts any status).
+            // Any response from a REAL upstream proves the route works —
+            // including 5xx from the app (health semantics belong to the
+            // deployment health check). 404/502/503 are gateway-generated
+            // errors meaning the route does not reach a live upstream.
+            const status = res.statusCode ?? 500;
             res.resume();
-            resolve(true);
+            resolve(status !== 404 && status !== 502 && status !== 503);
           },
         );
         req.on('timeout', () => {
