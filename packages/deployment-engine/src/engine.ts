@@ -22,6 +22,7 @@ import {
   AppRepository,
   AppConfigRepository,
   DeploymentEventRepository,
+  type ApplicationRow,
   type DeploymentRow,
 } from '@minicloud/db';
 import { buildConfigSnapshot, type ResourceLimits } from '@minicloud/shared';
@@ -39,6 +40,21 @@ export interface EngineConfig {
     healthTimeoutSeconds: number;
     healthIntervalSeconds: number;
   };
+  /** Port the MiniCloud gateway listens on; 0/undefined disables routing. */
+  gatewayPort?: number;
+  /** Max seconds to wait for in-flight requests before retiring the old
+   *  container after a cutover. */
+  drainTimeoutSeconds?: number;
+}
+
+/**
+ * The routing surface the engine drives during cutover. Implemented by the
+ * API-owned gateway; the engine never opens proxy ports itself.
+ */
+export interface TrafficGateway {
+  setRoute(slug: string, upstream: { deploymentId: string; host: string; port: number } | null): void;
+  activeRequests(slug: string): number;
+  verifyRoute(slug: string, path: string): Promise<boolean>;
 }
 
 export interface EngineLogger {
@@ -107,6 +123,18 @@ export const DEPLOYMENT_EVENTS = {
   deleted: 'deployment.deleted',
 } as const;
 
+/** Routing / traffic events (v0.4). */
+export const TRAFFIC_EVENTS = {
+  cutoverStarted: 'traffic.cutover_started',
+  cutoverCompleted: 'traffic.cutover_completed',
+  cutoverFailed: 'traffic.cutover_failed',
+  drainStarted: 'traffic.drain_started',
+  drainCompleted: 'traffic.drain_completed',
+  routeUpdated: 'gateway.route_updated',
+  upstreamUnavailable: 'gateway.upstream_unavailable',
+  superseded: 'deployment.superseded',
+} as const;
+
 /** Automatic-restart backoff: attempt N (1-based) waits min(2^N * 2s, 15s). */
 export function autoRestartDelayMs(attempt: number): number {
   return Math.min(2 ** attempt * 2000, 15_000);
@@ -170,6 +198,130 @@ export class DeploymentEngine {
 
   setAppConfigResolver(resolver: AppConfigResolver): void {
     this.appConfigResolver = resolver;
+  }
+
+  /** Registered by the API layer when the gateway is enabled. */
+  private gateway: TrafficGateway | null = null;
+
+  setGateway(gateway: TrafficGateway): void {
+    this.gateway = gateway;
+  }
+
+  /** Serialize traffic-affecting operations per application. */
+  private readonly appLocks = new Map<string, Promise<unknown>>();
+
+  private withAppLock<T>(applicationId: string, fn: () => Promise<T>): Promise<T> {
+    const prev = this.appLocks.get(applicationId) ?? Promise.resolve();
+    const next = prev.catch(() => {}).then(fn);
+    this.appLocks.set(applicationId, next.catch(() => {}));
+    return next;
+  }
+
+  private upstreamFor(deploymentId: string, hostPort: number): { deploymentId: string; host: string; port: number } | null {
+    if (!this.gateway || !hostPort) return null;
+    return { deploymentId, host: '127.0.0.1', port: hostPort };
+  }
+
+  // ---- traffic cutover (v0.4) --------------------------------------------------
+
+  /**
+   * Make a freshly-healthy deployment the application's active deployment.
+   * Runs under the application lock so concurrent deploys/rollbacks serialize.
+   * expectedOld is the active deployment observed when this pipeline started;
+   * if traffic has moved elsewhere in the meantime, this deployment was
+   * superseded and retires itself instead of stealing traffic.
+   */
+  private async activateDeployment(
+    deploymentId: string,
+    appRow: ApplicationRow,
+    expectedOld: string | null,
+    hostPort: number,
+    healthPath: string,
+  ): Promise<void> {
+    const gw = this.gateway;
+    const slug = appRow.route_slug;
+    if (!gw || !slug) return;
+    await this.withAppLock(appRow.id, async () => {
+      const fresh = await this.apps.byId(appRow.id);
+      if (!fresh) return;
+      const current = fresh.active_deployment_id;
+      if (current === deploymentId) return; // already active
+      if (current !== expectedOld) {
+        // A newer deployment won the race while this one was building.
+        await this.event(deploymentId, TRAFFIC_EVENTS.superseded, `traffic moved to ${short(current ?? '?')}`, {
+          activeDeploymentId: current,
+        });
+        await this.retireDeployment(deploymentId, 'superseded by a newer deployment');
+        return;
+      }
+
+      await this.event(deploymentId, TRAFFIC_EVENTS.cutoverStarted, `${short(current ?? 'none')} → ${short(deploymentId)}`, {
+        from: current,
+        to: deploymentId,
+      });
+      const swapped = await this.apps.setActiveDeployment(appRow.id, deploymentId, current);
+      if (!swapped) {
+        await this.event(deploymentId, TRAFFIC_EVENTS.superseded, 'traffic switched elsewhere during cutover');
+        await this.retireDeployment(deploymentId, 'superseded during cutover');
+        return;
+      }
+      gw.setRoute(slug, this.upstreamFor(deploymentId, hostPort));
+
+      const verified = await gw.verifyRoute(slug, healthPath);
+      if (!verified) {
+        await this.event(deploymentId, TRAFFIC_EVENTS.cutoverFailed, 'gateway verification failed; reverting traffic', {
+          from: current,
+          to: deploymentId,
+        });
+        if (current) {
+          const old = await this.deployments.byId(current);
+          await this.apps.setActiveDeployment(appRow.id, current, deploymentId);
+          const oldUpstream = old?.host_port ? this.upstreamFor(current, old.host_port) : null;
+          if (oldUpstream) gw.setRoute(slug, oldUpstream);
+        } else {
+          await this.apps.clearActiveDeployment(appRow.id, deploymentId);
+          gw.setRoute(slug, null);
+        }
+        await this.retireDeployment(deploymentId, 'cutover verification failed; previous version kept serving');
+        return;
+      }
+
+      await this.event(deploymentId, TRAFFIC_EVENTS.cutoverCompleted, `${slug} now serves ${short(deploymentId)}`, {
+        slug,
+        from: current,
+        to: deploymentId,
+      });
+      this.logger.info('traffic cutover complete', { deploymentId, slug, from: current });
+      if (current) await this.drainAndRetire(current, slug);
+    });
+  }
+
+  /** Wait for in-flight requests against the retired upstream, then stop it. */
+  private async drainAndRetire(deploymentId: string, slug: string): Promise<void> {
+    if (!this.gateway) return;
+    await this.event(deploymentId, TRAFFIC_EVENTS.drainStarted);
+    const budgetMs = (this.config.drainTimeoutSeconds ?? 10) * 1000;
+    const start = Date.now();
+    while (this.gateway.activeRequests(slug) > 0 && Date.now() - start < budgetMs) {
+      await new Promise((r) => setTimeout(r, 250));
+    }
+    await this.retireDeployment(deploymentId, 'retired after cutover');
+    await this.event(deploymentId, TRAFFIC_EVENTS.drainCompleted);
+  }
+
+  /** Stop a deployment's container and mark it STOPPED (record preserved). */
+  private async retireDeployment(deploymentId: string, reason: string): Promise<void> {
+    const row = await this.deployments.byId(deploymentId);
+    if (!row) return;
+    if (row.container_id) {
+      await this.docker.stop(row.container_id).catch(() => {});
+      await this.docker.remove(row.container_id, true).catch(() => {});
+      await this.deployments.updateFields(deploymentId, { container_id: null, container_name: null });
+    }
+    await this.deployments.transitionStatus(deploymentId, ['RUNNING', 'FAILED', 'STOPPED', 'HEALTH_CHECKING'], 'STOPPED', undefined, {
+      stoppedAt: new Date(),
+    });
+    this.logger.info('deployment retired', { deploymentId, reason });
   }
 
   /** Resolve config, mapping any resolver failure to EngineError(stage='config'). */
@@ -252,6 +404,9 @@ export class DeploymentEngine {
     if (!current) throw new EngineError(`Deployment ${deploymentId} not found`, 'pipeline');
     const app = await this.apps.byId(current.application_id);
     if (!app) throw new EngineError(`Application ${current.application_id} not found`, 'pipeline');
+    // Traffic target when this deployment started building; the cutover is
+    // guarded against this value so superseded builds never steal traffic.
+    const expectedOld = app.active_deployment_id;
 
     const deploymentTag = `minicloud/app-${app.id.slice(0, 8)}:d-${deploymentId.slice(0, 12)}`;
     const containerName = `minicloud-d-${deploymentId.slice(0, 12)}`;
@@ -507,6 +662,11 @@ export class DeploymentEngine {
       commitSha,
     });
     this.logger.info('deployment running', { deploymentId, app: app.name, hostPort, commitSha });
+
+    // Zero-downtime cutover: this deployment is healthy; switch traffic only
+    // now. expectedOld was captured when the pipeline started, so a deployment
+    // that finished after being superseded retires instead of stealing traffic.
+    await this.activateDeployment(deploymentId, app, expectedOld, hostPort, healthPath);
   }
 
   async failWithExitCode(deploymentId: string, reason: string): Promise<void> {
@@ -523,15 +683,27 @@ export class DeploymentEngine {
     this.logger.warn('deployment failed', { deploymentId, reason });
   }
 
-  /** Stop a deployment's container and mark STOPPED. Idempotent. */
-  async stopDeployment(deploymentId: string): Promise<DeploymentRow> {
+  /**
+   * Stop a deployment's container and mark STOPPED. Idempotent.
+   * Stopping the ACTIVE deployment takes the application offline; callers must
+   * pass {force:true} to acknowledge that explicitly.
+   */
+  async stopDeployment(deploymentId: string, opts: { force?: boolean } = {}): Promise<DeploymentRow> {
     return this.withLock(deploymentId, async () => {
       let row = await this.deployments.byId(deploymentId);
       if (!row) throw new EngineError('Deployment not found', 'stop');
+      const app = await this.apps.byId(row.application_id);
+      const isActive = app?.active_deployment_id === deploymentId;
+      if (isActive && opts.force !== true) {
+        throw new EngineError(
+          'This deployment is the ACTIVE deployment for its application. Stopping it makes the application unavailable. Repeat with force to confirm.',
+          'stop',
+        );
+      }
 
       // Cancel an in-flight pipeline (queued/cloning/building/... states).
       this.activeRuns.get(deploymentId)?.abort();
-      await this.event(deploymentId, DEPLOYMENT_EVENTS.stopRequested);
+      await this.event(deploymentId, DEPLOYMENT_EVENTS.stopRequested, isActive ? 'active deployment (forced)' : undefined);
       // A manual stop always cancels any pending automatic restart.
       await this.deployments.updateFields(deploymentId, { next_auto_restart_at: null });
       const allowed: DeploymentStatus[] = [
@@ -559,8 +731,15 @@ export class DeploymentEngine {
         await this.deployments.updateFields(deploymentId, { container_id: null, container_name: null });
       }
       this.activeRuns.delete(deploymentId);
+      // A forced stop of the active deployment takes the app offline.
+      if (isActive && app) {
+        await this.apps.clearActiveDeployment(app.id, deploymentId);
+        if (this.gateway && app.route_slug) {
+          this.gateway.setRoute(app.route_slug, null);
+          await this.event(deploymentId, TRAFFIC_EVENTS.upstreamUnavailable, 'active deployment stopped (forced)');
+        }
+      }
       await this.event(deploymentId, DEPLOYMENT_EVENTS.stopped);
-      this.logger.info('deployment stopped', { deploymentId });
       return row;
     });
   }
@@ -661,6 +840,14 @@ export class DeploymentEngine {
           truncate(`health check failed: ${health.lastError}`, 300),
         );
         await this.event(deploymentId, DEPLOYMENT_EVENTS.failed, truncate(`restart failed: ${health.lastError}`, 300));
+        // A terminal restart failure of the ACTIVE deployment takes the app
+        // offline: clear the route so the gateway answers 503 instead of
+        // silently proxying into a dead upstream.
+        if (app.active_deployment_id === deploymentId) {
+          await this.apps.clearActiveDeployment(app.id, deploymentId);
+          if (this.gateway && app.route_slug) this.gateway.setRoute(app.route_slug, null);
+          await this.event(deploymentId, TRAFFIC_EVENTS.upstreamUnavailable, 'active deployment restart failed');
+        }
         throw new EngineError(`Restart failed health check: ${health.lastError}`, 'restart');
       }
       const finalRow = await this.deployments.transitionStatus(
@@ -673,22 +860,46 @@ export class DeploymentEngine {
         `port ${hostPort}`,
         { hostPort },
       );
+      // A restarted container lands on a NEW ephemeral port: if this is the
+      // active deployment, the gateway must follow it.
+      if (app.active_deployment_id === deploymentId && this.gateway && app.route_slug) {
+        const upstream = this.upstreamFor(deploymentId, hostPort);
+        if (upstream) this.gateway.setRoute(app.route_slug, upstream);
+        const ok = this.gateway ? await this.gateway.verifyRoute(app.route_slug, healthPath) : false;
+        await this.event(
+          deploymentId,
+          TRAFFIC_EVENTS.routeUpdated,
+          ok ? `${app.route_slug} → port ${hostPort}` : `route update unverified for port ${hostPort}`,
+          { hostPort, verified: ok },
+        );
+      }
       return finalRow ?? (await this.deployments.byId(deploymentId))!;
     });
   }
 
-  /** Delete a deployment: remove container and row (events cascade away). */
-  async deleteDeployment(deploymentId: string): Promise<void> {
+  /** Delete a deployment: remove container and row (events cascade away).
+   *  Deleting the ACTIVE deployment makes the application unavailable; callers
+   *  must pass {force:true} to acknowledge that explicitly. */
+  async deleteDeployment(deploymentId: string, opts: { force?: boolean } = {}): Promise<void> {
     return this.withLock(deploymentId, async () => {
       const row = await this.deployments.byId(deploymentId);
       if (!row) return;
+      const app = await this.apps.byId(row.application_id);
+      if (app?.active_deployment_id === deploymentId && opts.force !== true) {
+        throw new EngineError(
+          'This deployment is the ACTIVE deployment for its application. Deleting it makes the application unavailable. Repeat with force to confirm.',
+          'delete',
+        );
+      }
       this.activeRuns.get(deploymentId)?.abort();
       if (row.container_id) {
         await this.docker.stop(row.container_id).catch(() => {});
         await this.docker.remove(row.container_id, true).catch(() => {});
       }
-      // Images are left in place: earlier deployments' images remain usable as
-      // rollback targets. `prune` removes images no deployment references.
+      if (app?.active_deployment_id === deploymentId) {
+        await this.apps.clearActiveDeployment(app.id, deploymentId);
+        if (this.gateway && app.route_slug) this.gateway.setRoute(app.route_slug, null);
+      }
       await this.event(deploymentId, DEPLOYMENT_EVENTS.deleted);
       await this.db.query('DELETE FROM deployments WHERE id = $1', [deploymentId]);
       this.logger.info('deployment deleted', { deploymentId });
@@ -796,6 +1007,15 @@ export class DeploymentEngine {
         { exitCode, policy, maxAttempts },
       );
       this.logger.warn('deployment failed (crash)', { deploymentId: row.id, exitCode, policy });
+      // Terminal crash of the ACTIVE deployment: nothing will recover it, so
+      // take the app route down (gateway answers 503) and clear the pointer.
+      if (app?.active_deployment_id === row.id) {
+        await this.apps.clearActiveDeployment(app.id, row.id);
+        if (this.gateway && app.route_slug) {
+          this.gateway.setRoute(app.route_slug, null);
+          await this.event(row.id, TRAFFIC_EVENTS.upstreamUnavailable, 'active deployment crashed terminally');
+        }
+      }
     }
   }
 
@@ -1036,6 +1256,51 @@ export class DeploymentEngine {
       }
     }
 
+
+    // Route rebuild: re-register gateway routes from persisted state and
+    // clear pointers that no longer match reality.
+    if (this.gateway) {
+      const appRows = await this.db.query<ApplicationRow>('SELECT * FROM applications');
+      for (const appRow of appRows.rows) {
+        if (!appRow.route_slug) continue;
+        const active = appRow.active_deployment_id
+          ? await this.deployments.byId(appRow.active_deployment_id)
+          : null;
+        const containerUp =
+          active?.container_id &&
+          (await this.docker.getContainerState(active.container_id).catch(() => null))?.running === true;
+        if (active && active.status === 'RUNNING' && containerUp && active.host_port) {
+          const upstream = this.upstreamFor(active.id, active.host_port);
+          if (upstream) this.gateway.setRoute(appRow.route_slug, upstream);
+        } else {
+          this.gateway.setRoute(appRow.route_slug, null);
+          // Terminal (and not merely awaiting an automatic restart): the
+          // pointer is stale — clear it so the app serves 503 honestly.
+          const pendingRecovery = active?.status === 'FAILED' && active.next_auto_restart_at !== null;
+          if (active && ['FAILED', 'STOPPED'].includes(active.status) && !pendingRecovery) {
+            await this.apps.clearActiveDeployment(appRow.id, active.id);
+          }
+        }
+      }
+      // Stale RUNNING deployments that are NOT their app's active deployment:
+      // leftovers from an interrupted cutover. They must not serve traffic.
+      const stale = await this.db.query<DeploymentRow>(
+        `SELECT d.* FROM deployments d
+         JOIN applications a ON a.id = d.application_id
+         WHERE d.status = 'RUNNING' AND a.active_deployment_id IS DISTINCT FROM d.id`,
+      );
+      for (const row of stale.rows) {
+        if (row.container_id) {
+          await this.docker.stop(row.container_id).catch(() => {});
+          await this.docker.remove(row.container_id, true).catch(() => {});
+          await this.deployments.updateFields(row.id, { container_id: null, container_name: null });
+        }
+        await this.deployments.transitionStatus(row.id, ['RUNNING'], 'STOPPED', undefined, { stoppedAt: new Date() });
+        fixed++;
+        this.logger.warn('reconciliation: retired stale non-active deployment', { deploymentId: row.id });
+      }
+    }
+
     this.logger.info('reconciliation complete', { fixed, orphansRemoved });
     return { fixed, orphansRemoved };
   }
@@ -1072,6 +1337,8 @@ export function defaultEngineConfigFromEnv(): EngineConfig {
       healthTimeoutSeconds: Number(process.env.HEALTH_TIMEOUT_SECONDS ?? 60),
       healthIntervalSeconds: Number(process.env.HEALTH_INTERVAL_SECONDS ?? 2),
     },
+    gatewayPort: Number(process.env.GATEWAY_PORT ?? 0),
+    drainTimeoutSeconds: Number(process.env.GATEWAY_DRAIN_TIMEOUT_SECONDS ?? 10),
   };
 }
 
