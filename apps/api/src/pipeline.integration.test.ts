@@ -29,13 +29,18 @@ async function waitForStatus(
   timeoutMs = 240_000,
 ): Promise<string> {
   const start = Date.now();
-  for (;;) {
-    const res = await ctx.app.inject({ method: 'GET', url: `/api/deployments/${deploymentId}` });
-    const status = res.json().status as string;
-    if (statuses.includes(status)) return status;
-    if (Date.now() - start > timeoutMs) throw new Error(`timed out waiting for ${statuses}; last=${status}`);
-    await new Promise((r) => setTimeout(r, 1500));
-  }
+  return (async () => {
+    for (;;) {
+      // Drive the crash processor explicitly: the background monitor is
+      // disabled in tests, and crash->FAILED transitions are its job.
+      await ctx.engine.checkCrashes();
+      const res = await ctx.app.inject({ method: 'GET', url: `/api/deployments/${deploymentId}` });
+      const status = res.json().status as string;
+      if (statuses.includes(status)) return status;
+      if (Date.now() - start > timeoutMs) throw new Error(`timed out waiting for ${statuses}; last=${status}`);
+      await new Promise((r) => setTimeout(r, 1500));
+    }
+  })();
 }
 
 

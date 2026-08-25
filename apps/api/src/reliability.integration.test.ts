@@ -356,8 +356,11 @@ describe('automatic restart policy (real docker)', () => {
     });
     const depId = await deploy(appId);
     await waitFor(
-      () => ctx.db.query('SELECT status, auto_restart_count FROM deployments WHERE id = $1', [depId])
-        .then((r) => `${r.rows[0]?.status}:${r.rows[0]?.auto_restart_count}`),
+      async () => {
+        await ctx.engine.checkCrashes();
+        return ctx.db.query('SELECT status, auto_restart_count FROM deployments WHERE id = $1', [depId])
+          .then((r) => `${r.rows[0]?.status}:${r.rows[0]?.auto_restart_count}`);
+      },
       (s) => s === 'RUNNING:1',
       120_000,
       'auto recovery to RUNNING:1',
@@ -368,7 +371,11 @@ describe('automatic restart policy (real docker)', () => {
     const stop = await ctx.app.inject({ method: 'POST', url: `/api/deployments/${depId}/stop?force=true` });
     expect(stop.json().status).toBe('STOPPED');
 
-    await new Promise((r) => setTimeout(r, 20_000));
+    // Exercise several monitor passes: none may resurrect the stopped deploy.
+    for (let i = 0; i < 5; i++) {
+      await ctx.engine.checkCrashes();
+      await new Promise((r) => setTimeout(r, 1000));
+    }
     const row = (await ctx.app.inject({ method: 'GET', url: `/api/deployments/${depId}` })).json();
     expect(row.status).toBe('STOPPED');
     expect(row.autoRestartCount).toBe(1);
