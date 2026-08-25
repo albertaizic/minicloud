@@ -5,6 +5,19 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and the project adheres to [Semantic Versioning](https://semver.org).
 
 
+## [Unreleased] — v0.5 multi-service, private networking, volumes
+
+### Added
+
+- **`minicloud.yml` manifest (version 1)**: multiple services per application with dockerfile/context, ports, public/private visibility, health paths, per-service env/resources/restart policy, `depends_on` (cycle-validated, topological start order) and named volumes. Strict schema — host mounts, privileged mode and arbitrary networks are unrepresentable
+- **Private application networking**: per-application Docker network (`minicloud-app-*`), service-name DNS aliases, `NAME_SERVICE_HOST/PORT` env injection; applications never share networks
+- **Public/private routing**: only `public: true` services get gateway routes (`<app>.localhost` for the primary, `<service>.<app>.localhost` for the rest); private services are unreachable via the gateway
+- **Persistent volumes**: MiniCloud-managed named volumes (`minicloud-<app8>-<name>`), surviving deployments, rollbacks and restarts; explicit destructive deletion only; never pruned
+- **Per-service observability**: service rows in deployment responses, `GET /api/deployments/:id/services`, per-service logs/metrics (`?service=`), `minicloud services/volumes`, service-scoped events (`service.*`, `network.created`, `volume.attached`)
+- **Per-service restart policies**: crash monitor handles service containers individually with per-service budgets; worker crashes never touch sibling services
+- **Multi-service rollback**: restores the entire previous revision (services, images, routing) while volumes persist
+- Example: `examples/multi-service-app` (web + api + worker + volume)
+
 ## [Unreleased] — v0.4 routing & zero-downtime deployments
 
 ### Added

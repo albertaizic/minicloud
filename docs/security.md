@@ -150,3 +150,27 @@ MiniCloud is a **single-user, local development PaaS**. We assume:
   reach the gateway port can reach any active app. Header-based routing means
   any HTTP client on the machine can address any app by setting the Host
   header — the same trust boundary as the rest of MiniCloud.
+
+
+## Multi-service manifests, networks and volumes (v0.5)
+
+Manifests are repository content — untrusted input. The parser rejects:
+path traversal in dockerfile/context, absolute paths, unknown fields
+(including `privileged`, host mounts, custom networks — there is simply no
+schema field for them), invalid ports/resources, duplicate service identities,
+dependency cycles, self/unknown dependencies, undeclared volume mounts, and
+mount targets outside absolute POSIX paths. Service names become Docker
+network aliases and gateway labels only after strict validation.
+
+- Networks and volumes are named exclusively by MiniCloud
+  (`minicloud-app-<id8>`, `minicloud-<id8>-<vol>`) — user input never reaches
+  Docker resource names unvalidated.
+- Private services get no host port and no gateway route: they are unreachable
+  from outside the application network (verified by tests). Cross-application
+  traffic would require a shared network, which MiniCloud never creates.
+- Volumes are Docker NAMED volumes; no host paths are ever mounted. Deletion
+  is explicit (`?volumes=true` / `?confirm=true`) and never implicit —
+  deploys, rollbacks, deployment deletion and prune preserve data.
+- Manifest snapshots are stored as non-secret deployment configuration;
+  secrets remain in the encrypted app-level store and never enter snapshots,
+  events or manifests.

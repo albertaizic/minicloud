@@ -1,4 +1,4 @@
-# API & CLI reference (v0.4)
+# API & CLI reference (v0.5)
 
 Base URL: `http://localhost:4000` (`PORT` / `HOST` in `.env`).
 All bodies are JSON; validation failures return `400` with
@@ -308,4 +308,45 @@ minicloud apps        # NAME / STATUS / ACTIVE / URL columns
 minicloud routes      # gateway routing table with request counters
 minicloud stop <id> --force     # required when <id> is the active deployment
 minicloud delete <id> --force
+```
+
+
+## Multi-service applications (v0.5)
+
+Repositories may ship a `minicloud.yml` (version 1). See the README for the
+full schema. Multi-service deployments expose:
+
+```
+GET /api/deployments/:id/services
+200 { "services": [ { "service": "web", "status": "RUNNING", "public": true,
+      "hostPort": 33421, "containerPort": 3000, "restartCount": 0, ... } ] }
+409 single-service deployment
+```
+
+Deployment serialization gains `multiService: boolean` and `services: [...]`.
+
+Per-service logs and metrics:
+
+```
+GET /api/deployments/:id/logs?service=api
+GET /api/deployments/:id/metrics?service=worker
+```
+
+Volumes:
+
+```
+GET  /api/apps/:id/volumes     # list (name, dockerVolume, createdAt)
+DELETE /api/apps/:id/volumes?confirm=true   # DESTRUCTIVE, explicit only
+```
+
+App deletion (`DELETE /api/apps/:id`) preserves volumes unless
+`?volumes=true` is passed.
+
+### CLI
+
+```
+minicloud services <app>
+minicloud volumes <app>
+minicloud logs <deployment> --service api
+minicloud stats <deployment> --service worker
 ```

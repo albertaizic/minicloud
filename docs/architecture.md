@@ -109,6 +109,37 @@ a CHECK-constrained status enum, migrated by `packages/db`'s runner. Ephemeral
 runtime objects (containers, images) are always reconcilable from Docker;
 durable history lives only in PostgreSQL.
 
+### Multi-service applications (v0.5)
+
+```mermaid
+graph TB
+    GW[Gateway :8080] -->|app.localhost| WEB
+    GW -->|api.app.localhost| API
+    subgraph NET[minicloud-app-* network]
+        WEB[web :3000]
+        API[api :4000]
+        WORKER[worker]
+    end
+    API --> VOL[(minicloud-* volume)]
+    WEB -.->|http://api:4000| API
+```
+
+- A `minicloud.yml` (version 1, strictly validated — no host mounts, no
+  privileged mode, no arbitrary networks) deploys one container per service.
+- Containers join a per-application network with the service name as alias;
+  the engine injects `NAME_SERVICE_HOST/PORT` env vars.
+- Services start in topological `depends_on` order. Public services get HTTP
+  health checks via their host port; private services/workers use
+  container-running state as health (the host cannot reach private container
+  IPs and no agent runs inside containers).
+- Each service has its own restart policy + attempt budget; the crash monitor
+  handles service containers individually (label `minicloud.service`).
+- Cutover swaps ALL public routes atomically after every service is healthy;
+  the previous deployment's services drain and retire together.
+- Volumes are Docker named volumes named `minicloud-<app8>-<name>`; they
+  persist across deployments/rollbacks and are never pruned. Application
+  deletion preserves them unless explicitly confirmed.
+
 ### Gateway, stable URLs and zero-downtime cutover (v0.4)
 
 An in-process reverse proxy (`packages/gateway`) listens on `GATEWAY_PORT`

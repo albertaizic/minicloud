@@ -58,6 +58,7 @@ solve, at an understandable scale.
 - **Rollback**: roll an application back to any previous successful deployment — creates a NEW deployment (history stays immutable), reuses the old image when available, rebuilds from the recorded commit otherwise
 - **Automatic restart policy**: `disabled` or `on-failure` with a bounded attempt budget (0–10) and capped exponential backoff; manual stop/restart resets the budget and suppresses recovery
 - **Runtime metrics**: live CPU %, memory used/limit, uptime and restart counts per deployment via Docker stats
+- **Multi-service applications (v0.5)**: declare `web`/`api`/`worker` services in `minicloud.yml` — private networking per app, persistent volumes, dependency ordering, per-service limits/restarts/logs/metrics
 - **Stable URLs + zero-downtime deploys (v0.4)**: every application gets `http://<app>.localhost:<gateway-port>`; replacements build and health-check in parallel, then traffic switches atomically — the old version keeps serving until the new one is verified
 - **REST API + CLI + web dashboard**
 - **PostgreSQL persistence** with migrations
@@ -179,6 +180,10 @@ minicloud restart-policy <app> [disabled|on-failure] [--max N]
 minicloud prune [--yes]                     # remove stopped containers, unreferenced
                                             # MiniCloud images, stale workspaces
 minicloud routes                            # gateway routing table + counters
+minicloud services <app>                    # per-service status table
+minicloud volumes <app>                     # persistent volumes of an app
+minicloud logs <deployment> --service api   # per-service logs
+minicloud stats <deployment> --service api  # per-service metrics
 
 # stop/delete of the ACTIVE deployment requires --force (explicit outage)
 ```
@@ -243,6 +248,61 @@ npm run build          # production builds
   Docker + PostgreSQL; exercise the real pipeline, env injection, cgroup
   limits (incl. OOM), events, rollback (image reuse + rebuild), automatic
   restart/retry exhaustion, metrics and reconciliation.
+
+## Multi-service applications (v0.5)
+
+Repositories may declare a `minicloud.yml` at the root (version 1):
+
+```yaml
+version: 1
+services:
+  web:
+    dockerfile: web/Dockerfile
+    context: web
+    port: 3000
+    public: true
+    health: { path: /health }
+    depends_on: [api]
+  api:
+    dockerfile: api/Dockerfile
+    context: api
+    port: 4000
+    public: false
+    resources: { memory_mb: 128, cpus: 0.25 }
+    volumes: [app-data:/data]
+  worker:
+    dockerfile: worker/Dockerfile
+    context: worker
+    public: false
+    restart: on-failure
+    max_restart_attempts: 3
+    depends_on: [api]
+volumes:
+  app-data: { driver: local }
+```
+
+- **Private networking**: every application gets a MiniCloud-managed Docker
+  network (`minicloud-app-*`); services resolve each other by name
+  (`http://api:4000`) and receive `NAME_SERVICE_HOST/PORT` env vars. Different
+  applications never share a network.
+- **Public routing**: only `public: true` services get gateway routes —
+  `<app>.localhost` (first public service) and `<service>.<app>.localhost`.
+  Private services are unreachable via the gateway (verified by tests).
+- **Workers**: services without a port get no host binding and no HTTP health
+  check; their health is the container running state.
+- **Volumes**: MiniCloud-managed named volumes (`minicloud-*`), scoped per
+  application, persisting across deployments, rollbacks and restarts. App
+  deletion preserves volumes unless `?volumes=true` is passed explicitly.
+  `prune` never touches volumes.
+- **Dependency ordering**: `depends_on` is validated at parse time (cycles,
+  unknown/self deps rejected) and services start topologically. A dependency
+  must have STARTED (and passed its HTTP health check when public) before
+  dependents start.
+- **Failure isolation**: one service crashing never touches its siblings;
+  restart policies are per service. A failed multi-service build/start leaves
+  the previous revision serving.
+- Repositories WITHOUT a manifest keep working exactly as before (single
+  service from the root Dockerfile).
 
 ## Stable URLs and zero-downtime deploys (v0.4)
 
