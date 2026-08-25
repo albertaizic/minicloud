@@ -131,6 +131,12 @@ export default function AppDetail() {
       </div>
       {error && <p className="error">{error}</p>}
 
+      {data.url && (
+        <p>
+          Stable URL:{' '}
+          <a href={data.url} target="_blank" rel="noreferrer" className="mono">{data.url}</a>
+        </p>
+      )}
       <h2>Restart policy</h2>
       <RestartPolicyEditor appId={data.id} initial={{ policy: data.restartPolicy, maxRestartAttempts: data.maxRestartAttempts }} />
 

@@ -51,6 +51,16 @@ export interface DeploymentDto {
   autoRestartCount: number;
   rollbackOf: string | null;
   isActive: boolean;
+  multiService: boolean;
+  services: Array<{
+    service: string;
+    status: string;
+    public: boolean;
+    containerName: string | null;
+    hostPort: number | null;
+    restartCount: number;
+    failureReason: string | null;
+  }> | null;
   config: ConfigSnapshotDto | null;
   createdAt: string;
   startedAt: string | null;
@@ -113,6 +123,8 @@ export const api = {
   getMetrics: (id: string) => req<MetricsDto>(`/api/deployments/${id}/metrics`),
   getRestartPolicy: (appId: string) =>
     req<RestartPolicyDto>(`/api/apps/${appId}/restart-policy`),
+  getVolumes: (appId: string) =>
+    req<{ volumes: Array<{ name: string; dockerVolume: string; createdAt: string }> }>(`/api/apps/${appId}/volumes`),
   getRoutes: () =>
     req<{
       gatewayPort: number;

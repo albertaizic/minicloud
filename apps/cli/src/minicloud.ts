@@ -130,12 +130,12 @@ async function cmdDeploy(url: string, opts: { name?: string; ref?: string }): Pr
   }
 }
 
-async function cmdLogs(idOrPrefix: string): Promise<void> {
+async function cmdLogs(idOrPrefix: string, service?: string): Promise<void> {
   const id = await deploymentIdArg(idOrPrefix);
   const d = await api.getDeployment(id).catch(() => fail(`deployment ${id} not found`));
   const fullId = d.id;
-  console.log(dim(`--- logs for ${short(d.id)} (${d.status}) ---`));
-  await api.streamLogs(fullId, (line) => console.log(line)).catch((err) => fail(err instanceof ApiError ? err.message : String(err)));
+  console.log(dim(`--- logs for ${short(d.id)} (${d.status})${service ? ` service ${service}` : ''} ---`));
+  await api.streamLogs(fullId, (line) => console.log(line), service).catch((err) => fail(err instanceof ApiError ? err.message : String(err)));
   // keep the process alive while the stream is open
   setInterval(() => {}, 1 << 30);
 }
@@ -284,10 +284,10 @@ function printStats(m: {
   console.log(`Status     ${statusColor(m.status)}`);
 }
 
-async function cmdStats(idOrPrefix: string, watch: boolean): Promise<void> {
+async function cmdStats(idOrPrefix: string, watch: boolean, service?: string): Promise<void> {
   const id = await deploymentIdArg(idOrPrefix);
   const render = async (): Promise<void> => {
-    const m = await reliabilityApi.metrics(id);
+    const m = await reliabilityApi.metrics(id, service);
     if (watch) process.stdout.write('\x1b[2J\x1b[H');
     printStats(m);
   };
@@ -429,7 +429,7 @@ async function main(): Promise<void> {
       return;
     }
     case 'logs':
-      await cmdLogs(positional[0] ?? '');
+      await cmdLogs(positional[0] ?? '', flags.service);
       return;
     case 'stop': {
       const id = await deploymentIdArg(positional[0] ?? '');
@@ -526,7 +526,7 @@ async function main(): Promise<void> {
       await cmdEvents(positional[0] ?? '');
       return;
     case 'stats':
-      await cmdStats(positional[0] ?? '', flags.watch === 'true');
+      await cmdStats(positional[0] ?? '', flags.watch === 'true', flags.service);
       return;
     case 'rollback':
       await cmdRollback(positional[0] ?? '', positional[1] ?? '');
@@ -537,6 +537,33 @@ async function main(): Promise<void> {
     case 'prune':
       await cmdPrune(flags.yes === 'true');
       return;
+    case 'services': {
+      const appId = await requireAppId(positional[0] ?? '');
+      const app = (await api.listApps()).find((a) => a.id === appId);
+      const latest = app?.latestDeployment;
+      if (!latest) fail('application has no deployments');
+      const { services } = await reliabilityApi.getServices(latest.id);
+      console.log(bold('SERVICE'.padEnd(14)) + 'STATUS'.padEnd(12) + 'VISIBILITY'.padEnd(12) + 'PORT'.padEnd(8) + 'RESTARTS');
+      for (const svc of services) {
+        console.log(
+          svc.service.padEnd(14) +
+          statusColor(svc.status).padEnd(20) +
+          (svc.public ? 'public' : 'private').padEnd(12) +
+          String(svc.hostPort ?? '—').padEnd(8) +
+          String(svc.restartCount),
+        );
+      }
+      return;
+    }
+    case 'volumes': {
+      const appId = await requireAppId(positional[0] ?? '');
+      const { volumes } = await reliabilityApi.getVolumes(appId);
+      if (volumes.length === 0) return console.log('no volumes');
+      for (const v of volumes) {
+        console.log(`${cyan(v.name).padEnd(24)} ${dim(v.dockerVolume)}  created ${v.createdAt.slice(0, 19)}  ${dim('(persists across deploys; NOT deleted with the app unless forced)')}`);
+      }
+      return;
+    }
     case 'routes': {
       const { gatewayPort, routes } = await reliabilityApi.routes();
       if (routes.length === 0) return console.log('no routes (no application has an active deployment)');

@@ -127,10 +127,10 @@ export const api = {
     request<void>('DELETE', `/api/deployments/${id}${opts.force ? '?force=true' : ''}`),
   logs: (id: string) =>
     request<{ logs?: { message: string }[]; message?: string }>('GET', `/api/deployments/${id}/logs`),
-  streamLogs: (id: string, onLine: (line: string) => void): Promise<() => void> => {
+  streamLogs: (id: string, onLine: (line: string) => void, service?: string): Promise<() => void> => {
     return new Promise((resolve, reject) => {
       const ctrl = new AbortController();
-      fetch(`${API_URL}/api/deployments/${id}/logs`, {
+      fetch(`${API_URL}/api/deployments/${id}/logs${service ? `?service=${encodeURIComponent(service)}` : ''}`, {
         headers: { accept: 'text/event-stream' },
         signal: ctrl.signal,
       })
@@ -173,8 +173,8 @@ export const reliabilityApi = {
       'GET',
       `/api/deployments/${deploymentId}/events`,
     ),
-  metrics: (deploymentId: string) =>
-    request<MetricsDto>('GET', `/api/deployments/${deploymentId}/metrics`),
+  metrics: (deploymentId: string, service?: string) =>
+    request<MetricsDto>('GET', `/api/deployments/${deploymentId}/metrics${service ? `?service=${encodeURIComponent(service)}` : ''}`),
   rollback: (appId: string, targetDeploymentId: string) =>
     request<{ deployment: DeploymentDto }>('POST', `/api/apps/${appId}/rollback`, {
       targetDeploymentId,
@@ -187,6 +187,16 @@ export const reliabilityApi = {
       ...(maxRestartAttempts !== undefined ? { maxRestartAttempts } : {}),
     }),
   prune: () => request<PruneResultDto>('POST', '/api/prune'),
+  getServices: (deploymentId: string) =>
+    request<{ services: Array<{ service: string; status: string; public: boolean; hostPort: number | null; restartCount: number; failureReason: string | null }> }>(
+      'GET',
+      `/api/deployments/${deploymentId}/services`,
+    ),
+  getVolumes: (appId: string) =>
+    request<{ volumes: Array<{ name: string; dockerVolume: string; createdAt: string }> }>(
+      'GET',
+      `/api/apps/${appId}/volumes`,
+    ),
   routes: () =>
     request<{
       gatewayPort: number;

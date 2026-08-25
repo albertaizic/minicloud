@@ -77,6 +77,27 @@ export default function DeploymentDetail() {
         <button onClick={() => act(() => api.stop(dep.id))}>Stop</button>
       </div>
       {error && <p className="error">{error}</p>}
+      {dep.services && dep.services.length > 0 && (
+        <>
+          <h2>Services</h2>
+          <table className="table">
+            <thead>
+              <tr><th>Service</th><th>Status</th><th>Visibility</th><th>Host port</th><th>Restarts</th></tr>
+            </thead>
+            <tbody>
+              {dep.services.map((sv) => (
+                <tr key={sv.service}>
+                  <td className="mono">{sv.service}</td>
+                  <td><StatusBadge status={sv.status} /></td>
+                  <td>{sv.public ? 'public' : 'private'}</td>
+                  <td className="mono">{sv.hostPort ?? '—'}</td>
+                  <td>{sv.restartCount}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </>
+      )}
       <h2>Metrics</h2>
       <MetricsCard deploymentId={dep.id} status={dep.status} />
       <h2>Events</h2>
