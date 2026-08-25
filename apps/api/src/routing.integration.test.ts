@@ -5,7 +5,7 @@
  */
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import http from 'node:http';
-import { closeTestContext, createTestApp, destroyTestContext, type TestContext } from './test-helpers.js';
+import { closeTestContext, createTestApp, destroyTestContext, waitUntilContainerExited, type TestContext } from './test-helpers.js';
 import { startFixtureServer, type FixtureServer } from './fixture-server.js';
 
 let ctx: TestContext;
@@ -243,7 +243,7 @@ describe('routing (real docker)', () => {
     ctx.docker.listManagedContainers().then((cs) => cs.filter((c) => c.labels['minicloud.deployment'] === depA).length);
     const containersBefore = await containersForDep();
 
-    // Simulate an API/gateway restart on the SAME database.
+    // Simulate a restart: stop the API process (containers keep running).
     const dbName = ctx.dbName;
     await closeTestContext(ctx);
     ctx = await createTestApp({ reuseDbName: dbName });
@@ -273,6 +273,7 @@ describe('routing (real docker)', () => {
     const start = Date.now();
     let recovered = false;
     while (Date.now() - start < 150_000) {
+      await ctx.engine.checkCrashes(); // explicit crash processing (no bg monitor)
       const r = await stableGet('rt-crashrec', '/health');
       if (r.status === 503 || r.status === 502) sawUnavailable = true;
       if (r.status === 200) {

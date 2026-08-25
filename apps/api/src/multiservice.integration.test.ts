@@ -200,10 +200,12 @@ describe('multi-service deployments (real docker)', () => {
     // Web (a different service) keeps serving through the stable URL.
     expect((await stableGet('ms-app', '/health')).status).toBe(200);
 
-    // The worker's on-failure policy restarts it automatically.
+    // The worker's on-failure policy restarts it. Crash processing is driven
+    // explicitly (the background monitor is disabled in tests).
     const start = Date.now();
     let recovered = false;
     while (Date.now() - start < 90_000) {
+      await ctx.engine.checkCrashes();
       const d = (await ctx.app.inject({ method: 'GET', url: `/api/deployments/${dep3}` })).json();
       const w = (d.services as Array<{ service: string; status: string }>).find((s) => s.service === 'worker');
       if (w?.status === 'RUNNING') { recovered = true; break; }

@@ -25,6 +25,10 @@ export interface TestContext {
   gatewayPort: number;
 }
 
+// Deterministic engine tests drive engine.checkCrashes()/reconcile()
+// explicitly; a live 5s background monitor would race them (CI Linux flake).
+process.env.CRASH_MONITOR_INTERVAL_MS = String(60 * 60 * 1000);
+
 export async function createTestApp(
   opts: { withMasterKey?: boolean; reuseDbName?: string } = {},
 ): Promise<TestContext> {
@@ -76,6 +80,27 @@ export async function createTestApp(
 export async function closeTestContext(ctx: TestContext): Promise<void> {
   await ctx.app.close().catch(() => {});
   await ctx.db.close().catch(() => {});
+}
+
+/**
+ * Wait until Docker actually reports the container exited. `docker stop`
+ * returning does not guarantee every subsequent inspect sees 'exited' on a
+ * loaded runner (exit-state visibility timing).
+ */
+export async function waitUntilContainerExited(
+  docker: { getContainerState(id: string): Promise<{ running: boolean } | null> },
+  containerId: string,
+  timeoutMs = 30_000,
+): Promise<void> {
+  const start = Date.now();
+  for (;;) {
+    const state = await docker.getContainerState(containerId).catch(() => null);
+    if (state === null || !state.running) return;
+    if (Date.now() - start > timeoutMs) {
+      throw new Error(`container ${containerId.slice(0, 12)} still running after ${timeoutMs}ms`);
+    }
+    await new Promise((r) => setTimeout(r, 250));
+  }
 }
 
 export async function destroyTestContext(ctx: TestContext): Promise<void> {

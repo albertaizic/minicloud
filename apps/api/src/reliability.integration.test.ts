@@ -5,7 +5,7 @@
  * Run with: npm run test:integration -w @minicloud/api
  */
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
-import { createTestApp, destroyTestContext, type TestContext } from './test-helpers.js';
+import { createTestApp, destroyTestContext, waitUntilContainerExited, type TestContext } from './test-helpers.js';
 import { startFixtureServer, type FixtureServer } from './fixture-server.js';
 
 let ctx: TestContext;
@@ -262,10 +262,16 @@ describe('automatic restart policy (real docker)', () => {
 
     const depId = await deploy(appId);
     // Initial start passes health, crashes ~5s in, and the automatic restart
-    // must bring it back: RUNNING with exactly one automatic attempt.
+    // must bring it back: RUNNING with exactly one automatic attempt. The
+    // crash processor is invoked explicitly (no background monitor in tests).
+    const recoverProbe = async (): Promise<string> => {
+      await ctx.engine.checkCrashes();
+      return ctx.db
+        .query('SELECT status, auto_restart_count FROM deployments WHERE id = $1', [depId])
+        .then((r) => `${r.rows[0]?.status}:${r.rows[0]?.auto_restart_count}`);
+    };
     await waitFor(
-      () => ctx.db.query('SELECT status, auto_restart_count FROM deployments WHERE id = $1', [depId])
-        .then((r) => `${r.rows[0]?.status}:${r.rows[0]?.auto_restart_count}`),
+      recoverProbe,
       (s) => s === 'RUNNING:1',
       150_000,
       'auto recovery to RUNNING:1',
@@ -297,10 +303,15 @@ describe('automatic restart policy (real docker)', () => {
     expect(put.statusCode).toBe(200);
 
     const depId = await deploy(appId);
-    // Initial run + 2 retries, then final FAILED.
+    // Initial run + 2 retries, then final FAILED. Each monitor pass is driven
+    // explicitly so retry accounting is deterministic under any runner load.
     await waitFor(
-      () => ctx.db.query('SELECT auto_restart_count, status, container_id FROM deployments WHERE id = $1', [depId])
-        .then((r) => `${r.rows[0]?.status}:${r.rows[0]?.auto_restart_count}:${r.rows[0]?.container_id ?? 'none'}`),
+      async () => {
+        await ctx.engine.checkCrashes();
+        return ctx.db
+          .query('SELECT auto_restart_count, status, container_id FROM deployments WHERE id = $1', [depId])
+          .then((r) => `${r.rows[0]?.status}:${r.rows[0]?.auto_restart_count}:${r.rows[0]?.container_id ?? 'none'}`);
+      },
       (s) => s.startsWith('FAILED:2:none'),
       240_000,
       'retry exhaustion (FAILED:2:none)',
@@ -427,15 +438,22 @@ describe('startup reconciliation (real docker)', () => {
 
     // Simulate a crash while the API is down: stop the container behind the API's back.
     expect(await ctx.docker.stop(containerId!, 1)).toBe(true);
+    await waitUntilContainerExited(ctx.docker, containerId!);
 
     // Startup reconciliation sees the dead container of a RUNNING row.
+    // (The background monitor is disabled in tests — this call is the only
+    // crash processor, so the outcome is deterministic.)
     const recon = await ctx.engine.reconcile();
     expect(recon.fixed).toBeGreaterThanOrEqual(1);
 
-    // Policy on-failure: the monitor pass then recovers it.
-    await ctx.engine.checkCrashes();
+    // Policy on-failure: recovery passes then restore it. Every monitor pass
+    // is driven explicitly — the background monitor is disabled in tests.
+    const recoveryProbe = async (): Promise<string> => {
+      await ctx.engine.checkCrashes();
+      return depStatus(depId);
+    };
     const status = await waitFor(
-      () => depStatus(depId),
+      recoveryProbe,
       (s) => s === 'RUNNING',
       120_000,
       'post-reconcile recovery',
@@ -457,6 +475,7 @@ describe('startup reconciliation (real docker)', () => {
     const containerId = await containerIdOf(depId);
     expect(containerId).toBeTruthy();
     await ctx.docker.stop(containerId!, 1);
+    await waitUntilContainerExited(ctx.docker, containerId!);
 
     await ctx.engine.reconcile();
     expect(await depStatus(depId)).toBe('FAILED');
