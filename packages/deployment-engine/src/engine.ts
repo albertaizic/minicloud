@@ -22,10 +22,20 @@ import {
   AppRepository,
   AppConfigRepository,
   DeploymentEventRepository,
+  DeploymentServiceRepository,
+  ApplicationVolumeRepository,
   type ApplicationRow,
   type DeploymentRow,
+  type DeploymentServiceRow,
 } from '@minicloud/db';
-import { buildConfigSnapshot, type ResourceLimits } from '@minicloud/shared';
+import {
+  buildConfigSnapshot,
+  loadManifest,
+  parseManifestSnapshot,
+  type Manifest,
+  type ParsedManifest,
+  type ResourceLimits,
+} from '@minicloud/shared';
 import { DockerRuntime, DockerUnavailableError, type ContainerResourceLimits } from '@minicloud/docker-runtime';
 import { cloneRepository } from './git.js';
 import { allocatePort, canBind } from './ports.js';
@@ -135,6 +145,21 @@ export const TRAFFIC_EVENTS = {
   superseded: 'deployment.superseded',
 } as const;
 
+/** Multi-service events (v0.5) — metadata carries serviceName, never secrets. */
+export const SERVICE_EVENTS = {
+  buildStarted: 'service.build_started',
+  buildCompleted: 'service.build_completed',
+  starting: 'service.starting',
+  started: 'service.started',
+  healthPassed: 'service.health_passed',
+  healthFailed: 'service.health_failed',
+  crashed: 'service.crashed',
+  restartScheduled: 'service.restart_scheduled',
+  recovered: 'service.recovered',
+  networkCreated: 'network.created',
+  volumeAttached: 'volume.attached',
+} as const;
+
 /** Automatic-restart backoff: attempt N (1-based) waits min(2^N * 2s, 15s). */
 export function autoRestartDelayMs(attempt: number): number {
   return Math.min(2 ** attempt * 2000, 15_000);
@@ -160,6 +185,8 @@ export class DeploymentEngine {
     this.apps = new AppRepository(db);
     this.appConfig = new AppConfigRepository(db);
     this.events = new DeploymentEventRepository(db);
+    this.services = new DeploymentServiceRepository(db);
+    this.volumes = new ApplicationVolumeRepository(db);
     // A relative WORKSPACE_DIR (the .env default) would otherwise be resolved
     // against git's own cwd inside cloneRepository — normalize once, here.
     this.config = { ...config, workspaceDir: path.resolve(config.workspaceDir) };
@@ -170,6 +197,8 @@ export class DeploymentEngine {
 
   private readonly appConfig: AppConfigRepository;
   private readonly events: DeploymentEventRepository;
+  private readonly services: DeploymentServiceRepository;
+  private readonly volumes: ApplicationVolumeRepository;
 
   /**
    * Persist a lifecycle event. Event persistence must never break the
@@ -430,6 +459,18 @@ export class DeploymentEngine {
       reuseImageTag = rollbackTarget.image_tag;
     }
 
+    // Multi-service rollback: the manifest comes from the target's snapshot
+    // and per-service images are reused when present (no clone/build at all).
+    if (rollbackTarget?.manifest_snapshot) {
+      const manifest = parseManifestSnapshot(rollbackTarget.manifest_snapshot);
+      if (!manifest) {
+        await fail('manifest', 'rollback target has an invalid manifest snapshot');
+        return;
+      }
+      await this.pipelineMulti(deploymentId, app, expectedOld, current.commit_sha ?? '', manifest, null, rollbackTarget);
+      return;
+    }
+
     const transitionOrDie = async (
       row: DeploymentRow | null,
       to: DeploymentStatus,
@@ -485,6 +526,21 @@ export class DeploymentEngine {
       await this.deployments.updateFields(deploymentId, { commit_sha: commitSha });
       await this.event(deploymentId, DEPLOYMENT_EVENTS.cloneCompleted, commitSha.slice(0, 12), { commitSha });
       this.logger.info('clone completed', { deploymentId, commitSha });
+
+      // minicloud.yml present -> multi-service deployment.
+      let parsedManifest: ParsedManifest | null = null;
+      try {
+        parsedManifest = await loadManifest(repoDir!);
+      } catch (err) {
+        await fail('manifest', err instanceof Error ? err.message : String(err));
+        await repoCleanup(repoDir);
+        return;
+      }
+      if (parsedManifest) {
+        await this.deployments.transitionStatus(deploymentId, ['CLONING'], 'BUILDING');
+        await this.pipelineMulti(deploymentId, app, expectedOld, commitSha, parsedManifest.manifest, repoDir, rollbackTarget);
+        return;
+      }
 
       if (!(await transitionOrDie(await this.deployments.byId(deploymentId), 'BUILDING'))) {
         await repoCleanup(repoDir);
@@ -730,6 +786,14 @@ export class DeploymentEngine {
         await this.docker.remove(row.container_id, true).catch(() => {});
         await this.deployments.updateFields(deploymentId, { container_id: null, container_name: null });
       }
+      // Multi-service: stop every service container as well.
+      for (const svc of await this.services.listByDeployment(deploymentId)) {
+        if (svc.container_id) {
+          await this.docker.stop(svc.container_id).catch(() => {});
+          await this.docker.remove(svc.container_id, true).catch(() => {});
+        }
+        await this.services.updateFields(svc.id, { status: 'STOPPED', container_id: null, container_name: null });
+      }
       this.activeRuns.delete(deploymentId);
       // A forced stop of the active deployment takes the app offline.
       if (isActive && app) {
@@ -906,6 +970,467 @@ export class DeploymentEngine {
     });
   }
 
+
+  // ---- multi-service deployments (v0.5) ---------------------------------------
+
+  /** Docker network name for an application (sanitized, no user input beyond the uuid). */
+  private appNetworkName(appId: string): string {
+    return `minicloud-app-${appId.slice(0, 8)}`;
+  }
+
+  /** Docker volume name for an application volume (sanitized). */
+  private appVolumeName(appId: string, volumeName: string): string {
+    return `minicloud-${appId.slice(0, 8)}-${volumeName}`;
+  }
+
+  /**
+   * Tear down the application network after app deletion. Volumes are NEVER
+   * removed here — persistent data outlives the application unless the caller
+   * explicitly opts in via deleteApplicationVolumes.
+   */
+  async removeAppNetwork(appId: string): Promise<boolean> {
+    return this.docker.removeNetwork(this.appNetworkName(appId));
+  }
+
+  /** Explicit, destructive: remove all of an application's volumes. */
+  async removeApplicationVolumes(appId: string): Promise<number> {
+    const rows = await this.volumes.listByApplication(appId);
+    let removed = 0;
+    for (const v of rows) {
+      if (await this.docker.removeVolume(v.docker_volume)) removed++;
+    }
+    return removed;
+  }
+
+  async listApplicationVolumes(appId: string) {
+    return this.volumes.listByApplication(appId);
+  }
+
+  /**
+   * Multi-service deployment pipeline. Preconditions: CLONING/BUILDING state,
+   * repository cloned at repoDir (unless pure image-reuse rollback), manifest
+   * parsed and validated.
+   *
+   * Health semantics (documented in docs/architecture.md):
+   *  - PUBLIC services: HTTP health check against their host port.
+   *  - PRIVATE services / workers: container-running state (the host cannot
+   *    reach private container IPs; no agent is installed inside containers).
+   *  - depends_on: startup ordering only — dependencies must have STARTED (and
+   *    passed their HTTP health check when public) before dependents start.
+   */
+  private async pipelineMulti(
+    deploymentId: string,
+    app: ApplicationRow,
+    expectedOld: string | null,
+    commitSha: string,
+    manifest: Manifest,
+    repoDir: string | null,
+    rollbackTarget: DeploymentRow | null,
+  ): Promise<void> {
+    const abort = new AbortController();
+    this.activeRuns.set(deploymentId, abort);
+    const appNetwork = this.appNetworkName(app.id);
+    const deploymentTagBase = `minicloud/app-${app.id.slice(0, 8)}`;
+
+    // Rollback fast path enters in QUEUED (no clone/build happened): walk the
+    // state machine to BUILDING so the STARTING transition is legal.
+    const entryStatus = (await this.deployments.byId(deploymentId))?.status;
+    if (entryStatus === 'QUEUED') {
+      for (const [from, to] of [['QUEUED', 'CLONING'], ['CLONING', 'BUILDING']] as const) {
+        if (!(await this.deployments.transitionStatus(deploymentId, [from], to))) return;
+      }
+    }
+
+    const fail = async (stage: string, message: string): Promise<void> => {
+      await this.transition(deploymentId, null, 'FAILED', {
+        failure_reason: `${stage}: ${truncate(message, 1000)}`,
+      });
+      await this.event(deploymentId, DEPLOYMENT_EVENTS.failed, `${stage}: ${truncate(message, 300)}`);
+      this.logger.error('multi-service deployment failed', { deploymentId, stage });
+    };
+
+    try {
+      // Manifest snapshot (immutable record of what this revision deploys).
+      await this.deployments.updateFields(deploymentId, {
+        manifest_snapshot: manifest as unknown as Record<string, unknown>,
+      });
+
+      // Service rows.
+      for (const svc of manifest.services) {
+        await this.services.create(deploymentId, {
+          serviceName: svc.name,
+          containerPort: svc.port ?? null,
+          healthPath: svc.public ? (svc.health?.path ?? this.config.defaults.healthPath) : null,
+          publicService: svc.public,
+        });
+      }
+
+      // Network + volumes (idempotent; volumes persist across deployments).
+      await this.docker.ensureNetwork(appNetwork);
+      await this.event(deploymentId, SERVICE_EVENTS.networkCreated, appNetwork, { network: appNetwork });
+      const volumeMountsByService: Record<string, Array<{ volume: string; target: string }>> = {};
+      for (const volName of Object.keys(manifest.volumes)) {
+        const dockerVolume = this.appVolumeName(app.id, volName);
+        await this.docker.ensureVolume(dockerVolume);
+        await this.volumes.ensure(app.id, volName, dockerVolume);
+        await this.event(deploymentId, SERVICE_EVENTS.volumeAttached, `${volName} → ${dockerVolume}`, {
+          volume: volName,
+          dockerVolume,
+        });
+      }
+      for (const svc of manifest.services) {
+        volumeMountsByService[svc.name] = svc.volumes.map((mount) => {
+          const [volName, target] = mount.split(':') as [string, string];
+          return { volume: this.appVolumeName(app.id, volName), target };
+        });
+      }
+
+      // Rollback image reuse: per-service images from the target deployment.
+      let reusedImages: Record<string, string> | null = null;
+      if (rollbackTarget) {
+        const targetServices = await this.services.listByDeployment(rollbackTarget.id);
+        const images: Record<string, string> = {};
+        for (const ts of targetServices) {
+          if (ts.image_tag && (await this.docker.imageExists(ts.image_tag))) {
+            images[ts.service_name] = ts.image_tag;
+          }
+        }
+        if (Object.keys(images).length === targetServices.length) {
+          reusedImages = images; // full set available: skip clone/build entirely
+        }
+      }
+      const needBuild = !reusedImages;
+
+      // Build every service image.
+      if (needBuild && repoDir) {
+        for (const svc of manifest.startOrder) {
+          const svcDef = manifest.services.find((sd) => sd.name === svc)!;
+          // dockerode looks the dockerfile up INSIDE the build context.
+          const dockerfileInContext = path.posix.relative(svcDef.context, svcDef.dockerfile);
+          if (dockerfileInContext.startsWith('..')) {
+            await fail('build', `service "${svc}": dockerfile must live inside the build context`);
+            await repoCleanup(repoDir);
+            return;
+          }
+          const tag = `${deploymentTagBase}:${svc}-d-${deploymentId.slice(0, 12)}`;
+          await this.event(deploymentId, SERVICE_EVENTS.buildStarted, `${svc}: ${tag}`, {
+            serviceName: svc,
+            imageTag: tag,
+          });
+          try {
+            await this.docker.build({
+              contextDir: path.resolve(repoDir, svcDef.context),
+              tag,
+              dockerfile: dockerfileInContext,
+              onOutput: (chunk) => {
+                for (const line of chunk.split(/\r?\n/)) {
+                  if (line.trim()) this.emitLog(deploymentId, { source: 'build', stream: 'stdout', message: line });
+                }
+              },
+            });
+            await this.event(deploymentId, SERVICE_EVENTS.buildCompleted, svc, { serviceName: svc, imageTag: tag });
+          } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            await this.services.updateFields(
+              (await this.services.byName(deploymentId, svc))!.id,
+              { status: 'FAILED', failure_reason: truncate(`build failed: ${msg}`, 500) },
+            );
+            await this.event(deploymentId, SERVICE_EVENTS.healthFailed, `build failed: ${svc}`, { serviceName: svc });
+            await fail('build', `service "${svc}": ${msg}`);
+            await repoCleanup(repoDir);
+            return;
+          }
+        }
+      }
+
+      // Effective app configuration (env/secrets/limits) once for all services.
+      let cfg: ResolvedAppConfig;
+      try {
+        cfg = await this.resolvedConfig(app.id);
+      } catch (err) {
+        await fail('config', err instanceof Error ? err.message : String(err));
+        if (repoDir) await repoCleanup(repoDir);
+        return;
+      }
+
+      // ---- STARTING ---------------------------------------------------------
+      if (!(await this.deployments.transitionStatus(deploymentId, ['BUILDING'], 'STARTING'))) {
+        if (repoDir) await repoCleanup(repoDir);
+        return;
+      }
+
+      // Start services in dependency order.
+      const startedContainers: Array<{ service: string; containerId: string; hostPort: number | null }> = [];
+      const publicRoutes: Array<{ key: string; service: string; hostPort: number; healthPath: string }> = [];
+      let firstPublicPort: number | null = null;
+      let firstPublicHealth = this.config.defaults.healthPath;
+
+      for (const svcName of manifest.startOrder) {
+        const svcDef = manifest.services.find((s) => s.name === svcName)!;
+        const svcRow = (await this.services.byName(deploymentId, svcName))!;
+        const image =
+          reusedImages?.[svcName] ?? `${deploymentTagBase}:${svcName}-d-${deploymentId.slice(0, 12)}`;
+
+        const env: Record<string, string> = { ...cfg.env, ...(svcDef.env ?? {}) };
+        // Service registry env: services resolve each other by name.
+        for (const other of manifest.services) {
+          if (other.name === svcName || !other.port) continue;
+          env[`${other.name.toUpperCase().replace(/-/g, '_')}_SERVICE_HOST`] = other.name;
+          env[`${other.name.toUpperCase().replace(/-/g, '_')}_SERVICE_PORT`] = String(other.port);
+        }
+
+        const isPublic = svcDef.public && !!svcDef.port;
+        let hostPort = 0;
+        if (isPublic) {
+          try {
+            hostPort = await allocatePort(this.config.portRange);
+            if (!(await canBind(hostPort))) throw new EngineError('port became unavailable', 'port');
+          } catch (err) {
+            await this.cleanupFailedStart(deploymentId, startedContainers);
+            await fail('port', `service "${svcName}": ${err instanceof Error ? err.message : String(err)}`);
+            if (repoDir) await repoCleanup(repoDir);
+            return;
+          }
+        }
+
+        const containerName = `minicloud-d-${deploymentId.slice(0, 12)}-${svcName}`;
+        await this.event(deploymentId, SERVICE_EVENTS.starting, svcName, { serviceName: svcName });
+        let containerId: string;
+        try {
+          const started = await this.docker.startManagedContainer({
+            image,
+            name: containerName,
+            appLabel: app.id,
+            deploymentLabel: deploymentId,
+            serviceLabel: svcName,
+            containerPort: svcDef.port ?? 0,
+            hostPort,
+            env,
+            limits: svcDef.resources
+              ? this.dockerLimits({ memoryLimitMb: svcDef.resources.memoryLimitMb, cpuLimit: svcDef.resources.cpuLimit })
+              : {},
+            networks: [{ name: appNetwork, alias: svcName }],
+            volumeMounts: volumeMountsByService[svcName] ?? [],
+          });
+          containerId = started.id;
+        } catch (err) {
+          await this.cleanupFailedStart(deploymentId, startedContainers);
+          await fail('start', `service "${svcName}": ${err instanceof Error ? err.message : String(err)}`);
+          if (repoDir) await repoCleanup(repoDir);
+          return;
+        }
+
+        const healthPath = svcDef.health?.path ?? this.config.defaults.healthPath;
+        await this.services.updateFields(svcRow.id, {
+          status: 'HEALTH_CHECKING',
+          image_tag: image,
+          container_id: containerId,
+          container_name: containerName,
+          host_port: hostPort || null,
+          container_port: svcDef.port ?? null,
+        });
+        startedContainers.push({ service: svcName, containerId, hostPort: hostPort || null });
+
+        // Health: public services get an HTTP check; private ones are
+        // "healthy" when the container stays up for a short grace period.
+        if (isPublic) {
+          const ok = await waitForHealthy({
+            hostPort,
+            path: healthPath,
+            timeoutSeconds: svcDef.health?.timeoutSeconds ?? this.config.defaults.healthTimeoutSeconds,
+            intervalSeconds: this.config.defaults.healthIntervalSeconds,
+            signal: abort.signal,
+          });
+          if (!ok.ok) {
+            await this.event(deploymentId, SERVICE_EVENTS.healthFailed, `${svcName}: ${truncate(ok.lastError ?? '', 200)}`, {
+              serviceName: svcName,
+            });
+            await this.services.transitionStatus(svcRow.id, ['HEALTH_CHECKING'], 'FAILED', {
+              failure_reason: `health check failed: ${truncate(ok.lastError ?? '', 300)}`,
+            });
+            await this.cleanupFailedStart(deploymentId, startedContainers);
+            await fail('health', `service "${svcName}": ${ok.lastError ?? 'unhealthy'}`);
+            if (repoDir) await repoCleanup(repoDir);
+            return;
+          }
+          await this.event(deploymentId, SERVICE_EVENTS.healthPassed, svcName, { serviceName: svcName });
+          publicRoutes.push({ key: publicRoutes.length === 0 ? app.route_slug! : `${svcName}.${app.route_slug}`, service: svcName, hostPort, healthPath });
+          if (publicRoutes.length === 1) {
+            firstPublicPort = hostPort;
+            firstPublicHealth = healthPath;
+          }
+        } else {
+          // Private/worker: brief grace period; a crash here fails the start.
+          await new Promise((r) => setTimeout(r, 750));
+          const state = await this.docker.getContainerState(containerId).catch(() => null);
+          if (!state?.running) {
+            const exit = state?.exitCode;
+            await this.services.transitionStatus(svcRow.id, ['HEALTH_CHECKING'], 'FAILED', {
+              failure_reason: `container exited during startup${exit !== null ? ` (exit ${exit})` : ''}`,
+              exit_code: exit,
+            });
+            await this.cleanupFailedStart(deploymentId, startedContainers);
+            await fail('start', `service "${svcName}" exited during startup`);
+            if (repoDir) await repoCleanup(repoDir);
+            return;
+          }
+        }
+        await this.event(deploymentId, SERVICE_EVENTS.started, svcName, { serviceName: svcName, containerId: short(containerId) });
+        await this.services.transitionStatus(svcRow.id, ['HEALTH_CHECKING'], 'RUNNING');
+      }
+
+      if (repoDir) await repoCleanup(repoDir);
+
+      await this.deployments.updateFields(deploymentId, { image_tag: `${deploymentTagBase}:d-${deploymentId.slice(0, 12)}` });
+
+      // ---- RUNNING ----------------------------------------------------------
+      if (!(await this.deployments.transitionStatus(deploymentId, ['STARTING'], 'RUNNING', undefined, { startedAt: new Date() }))) {
+        return;
+      }
+      this.activeRuns.delete(deploymentId);
+      await this.event(deploymentId, DEPLOYMENT_EVENTS.running, `multi-service (${manifest.services.length} services)`, {
+        services: manifest.services.map((s) => s.name),
+      });
+      this.logger.info('multi-service deployment running', { deploymentId, app: app.name });
+
+      // Cutover: same guarded swap as single-service, but routes cover every
+      // public service of the manifest.
+      await this.activateMulti(deploymentId, app, expectedOld, publicRoutes, firstPublicPort, firstPublicHealth);
+    } catch (err) {
+      // Anything unexpected: fail loudly, previous version keeps serving.
+      await fail('pipeline', err instanceof Error ? err.message : String(err));
+    }
+  }
+
+  /** Remove all containers started by a failed multi-service start. */
+  private async cleanupFailedStart(
+    deploymentId: string,
+    started: Array<{ service: string; containerId: string; hostPort: number | null }>,
+  ): Promise<void> {
+    for (const c of started) {
+      await this.docker.stop(c.containerId).catch(() => {});
+      await this.docker.remove(c.containerId, true).catch(() => {});
+      const svcRow = await this.services.byName(deploymentId, c.service);
+      if (svcRow) {
+        await this.services.updateFields(svcRow.id, { status: 'STOPPED', container_id: null, container_name: null });
+      }
+    }
+  }
+
+  /**
+   * Multi-service cutover: guarded swap + gateway routes for every public
+   * service + verification + drain of the previous deployment's services.
+   */
+  private async activateMulti(
+    deploymentId: string,
+    app: ApplicationRow,
+    expectedOld: string | null,
+    publicRoutes: Array<{ key: string; service: string; hostPort: number; healthPath: string }>,
+    firstPublicPort: number | null,
+    firstPublicHealth: string,
+  ): Promise<void> {
+    if (!this.gateway || !app.route_slug) return;
+    const gw = this.gateway;
+    await this.withAppLock(app.id, async () => {
+      const fresh = await this.apps.byId(app.id);
+      if (!fresh) return;
+      const current = fresh.active_deployment_id;
+      if (current === deploymentId) return;
+      if (current !== expectedOld) {
+        await this.event(deploymentId, TRAFFIC_EVENTS.superseded, `traffic moved to ${short(current ?? '?')}`);
+        await this.retireMulti(deploymentId, 'superseded by a newer deployment');
+        return;
+      }
+
+      await this.event(deploymentId, TRAFFIC_EVENTS.cutoverStarted, `${short(current ?? 'none')} → ${short(deploymentId)}`, {
+        from: current,
+        to: deploymentId,
+      });
+      const swapped = await this.apps.setActiveDeployment(app.id, deploymentId, current);
+      if (!swapped) {
+        await this.event(deploymentId, TRAFFIC_EVENTS.superseded, 'traffic switched elsewhere during cutover');
+        await this.retireMulti(deploymentId, 'superseded during cutover');
+        return;
+      }
+
+      // Routes: <slug> -> first public service; <service>.<slug> -> each.
+      for (const r of publicRoutes) {
+        gw.setRoute(r.key, this.upstreamFor(deploymentId, r.hostPort) ?? { deploymentId, host: '127.0.0.1', port: r.hostPort });
+      }
+
+      // Verify every public route through the gateway.
+      let allVerified = true;
+      for (const r of publicRoutes) {
+        if (!(await gw.verifyRoute(r.key, r.healthPath))) {
+          allVerified = false;
+          break;
+        }
+      }
+      if (!allVerified) {
+        await this.event(deploymentId, TRAFFIC_EVENTS.cutoverFailed, 'gateway verification failed; reverting traffic');
+        if (current) {
+          await this.apps.setActiveDeployment(app.id, current, deploymentId);
+          const oldServices = await this.services.listByDeployment(current);
+          for (const os of oldServices) {
+            if (os.public_service && os.host_port) {
+              const key = os.service_name === publicRoutes[0]?.service ? app.route_slug! : `${os.service_name}.${app.route_slug}`;
+              gw.setRoute(key, this.upstreamFor(current, os.host_port) ?? { deploymentId: current, host: '127.0.0.1', port: os.host_port });
+            }
+          }
+        } else {
+          for (const r of publicRoutes) gw.setRoute(r.key, null);
+          await this.apps.clearActiveDeployment(app.id, deploymentId);
+        }
+        await this.retireMulti(deploymentId, 'cutover verification failed; previous version kept serving');
+        return;
+      }
+
+      await this.event(deploymentId, TRAFFIC_EVENTS.cutoverCompleted, `${app.route_slug} cutover complete`, {
+        slug: app.route_slug,
+        from: current,
+        to: deploymentId,
+        services: publicRoutes.map((r) => r.service),
+      });
+      if (current) await this.drainAndRetireMulti(current, publicRoutes[0]?.key ?? app.route_slug!);
+    });
+  }
+
+  /** Drain the previous multi-service deployment and retire all services. */
+  private async drainAndRetireMulti(deploymentId: string, routeKey: string): Promise<void> {
+    if (!this.gateway) return;
+    await this.event(deploymentId, TRAFFIC_EVENTS.drainStarted);
+    const budgetMs = (this.config.drainTimeoutSeconds ?? 10) * 1000;
+    const start = Date.now();
+    while (this.gateway.activeRequests(routeKey) > 0 && Date.now() - start < budgetMs) {
+      await new Promise((r) => setTimeout(r, 250));
+    }
+    await this.retireMulti(deploymentId, 'retired after cutover');
+    await this.event(deploymentId, TRAFFIC_EVENTS.drainCompleted);
+  }
+
+  /** Stop all service containers of a deployment and mark everything STOPPED. */
+  private async retireMulti(deploymentId: string, reason: string): Promise<void> {
+    const rows = await this.services.listByDeployment(deploymentId);
+    for (const svc of rows) {
+      if (svc.container_id) {
+        await this.docker.stop(svc.container_id).catch(() => {});
+        await this.docker.remove(svc.container_id, true).catch(() => {});
+        await this.services.updateFields(svc.id, { status: 'STOPPED', container_id: null, container_name: null });
+      } else if (svc.status === 'QUEUED' || svc.status === 'HEALTH_CHECKING') {
+        await this.services.updateFields(svc.id, { status: 'STOPPED' });
+      }
+    }
+    await this.deployments.transitionStatus(
+      deploymentId,
+      ['RUNNING', 'FAILED', 'STOPPED', 'HEALTH_CHECKING', 'STARTING', 'BUILDING', 'CLONING', 'QUEUED'],
+      'STOPPED',
+      undefined,
+      { stoppedAt: new Date() },
+    );
+    this.logger.info('multi-service deployment retired', { deploymentId, reason });
+  }
+
+
   // ---- crash detection & automatic recovery ---------------------------------
 
   /**
@@ -929,6 +1454,114 @@ export class DeploymentEngine {
         await this.handleCrash(row, state, 'Container exited unexpectedly');
       }
     }
+    // Multi-service: per-service crash detection (single-service deployments
+    // have no service rows, so this is a no-op for them).
+    const svcRows = await this.db.query<DeploymentServiceRow>(
+      `SELECT s.* FROM deployment_services s
+       JOIN deployments d ON d.id = s.deployment_id
+       WHERE d.status = 'RUNNING' AND s.status = 'RUNNING' AND s.container_id IS NOT NULL`,
+    );
+    for (const svc of svcRows.rows) {
+      const state = await this.docker.getContainerState(svc.container_id!).catch(() => null);
+      if (state === null || !state.running) {
+        await this.handleServiceCrash(svc, state);
+      }
+    }
+  }
+
+  /**
+   * Per-service crash handling. Semantics (documented): one service crashing
+   * never touches its siblings; the service restarts per ITS manifest policy
+   * with its own budget; a public service of the ACTIVE deployment that dies
+   * terminally takes its gateway route down (503).
+   */
+  private async handleServiceCrash(
+    svc: DeploymentServiceRow,
+    state: { running: boolean; exitCode: number | null } | null,
+  ): Promise<void> {
+    await this.withLock(svc.deployment_id, async () => {
+      const fresh = await this.services.byName(svc.deployment_id, svc.service_name);
+      if (!fresh || fresh.status !== 'RUNNING' || fresh.container_id !== svc.container_id) {
+        return; // raced with a restart/cutover
+      }
+      const dep = await this.deployments.byId(svc.deployment_id);
+      const app = dep ? await this.apps.byId(dep.application_id) : null;
+      const exitCode = state?.exitCode ?? null;
+
+      await this.event(svc.deployment_id, SERVICE_EVENTS.crashed, `${svc.service_name} exited (code ${exitCode ?? '?'})`, {
+        serviceName: svc.service_name,
+        exitCode,
+      });
+      if (svc.container_id) {
+        await this.docker.stop(svc.container_id).catch(() => {});
+        await this.docker.remove(svc.container_id, true).catch(() => {});
+        await this.services.updateFields(fresh.id, { container_id: null, container_name: null, host_port: null });
+      }
+
+      // Policy comes from the deployment's manifest snapshot.
+      const snap = dep ? parseManifestSnapshot(dep.manifest_snapshot) : null;
+      const svcDef = snap?.services.find((sd) => sd.name === svc.service_name);
+      const policy = svcDef?.restart ?? 'disabled';
+      const maxAttempts = svcDef?.maxRestartAttempts ?? 0;
+
+      const failed = await this.services.transitionStatus(fresh.id, ['RUNNING'], 'FAILED', {
+        failure_reason: `container exited unexpectedly${exitCode !== null ? ` (exit code ${exitCode})` : ''}`,
+        exit_code: exitCode,
+      });
+      if (!failed) return;
+
+      if (policy === 'on-failure' && failed.auto_restart_count < maxAttempts) {
+        const attempt = failed.auto_restart_count + 1;
+        const delayMs = autoRestartDelayMs(attempt);
+        await this.services.updateFields(fresh.id, { next_auto_restart_at: new Date(Date.now() + delayMs) });
+        await this.event(
+          svc.deployment_id,
+          SERVICE_EVENTS.restartScheduled,
+          `${svc.service_name} attempt ${attempt}/${maxAttempts} in ${Math.round(delayMs / 1000)}s`,
+          { serviceName: svc.service_name, attempt, maxAttempts },
+        );
+      } else {
+        await this.event(
+          svc.deployment_id,
+          SERVICE_EVENTS.crashed,
+          `${svc.service_name} failed terminally (policy ${policy}, attempts ${maxAttempts})`,
+          { serviceName: svc.service_name, policy },
+        );
+        // Public service of the active deployment: take its route down.
+        const active = app?.active_deployment_id === svc.deployment_id;
+        const isPublicRoute = fresh.public_service;
+        if (active && this.gateway && app?.route_slug && isPublicRoute) {
+          const key = (await this.publicServiceKeys(dep!, app)).find((k) => k.service === svc.service_name);
+          if (key) this.gateway.setRoute(key.key, null);
+          await this.event(svc.deployment_id, TRAFFIC_EVENTS.upstreamUnavailable, `${svc.service_name} unavailable`);
+        }
+      }
+    });
+  }
+
+  /** Public route keys (key + service name) for a deployment. */
+  private async publicServiceKeys(
+    dep: DeploymentRow,
+    app: ApplicationRow,
+  ): Promise<Array<{ key: string; service: string; hostPort: number; healthPath: string }>> {
+    const snap = dep.manifest_snapshot as unknown as { services: Array<{ name: string; port?: number; public: boolean; health?: { path: string } }> } | null;
+    if (!snap) return [];
+    const rows = await this.services.listByDeployment(dep.id);
+    const keys: Array<{ key: string; service: string; hostPort: number; healthPath: string }> = [];
+    let first = true;
+    for (const sd of snap.services) {
+      if (!sd.public || !sd.port) continue;
+      const row = rows.find((r) => r.service_name === sd.name);
+      if (!row?.host_port) continue;
+      keys.push({
+        key: first ? app.route_slug! : `${sd.name}.${app.route_slug}`,
+        service: sd.name,
+        hostPort: row.host_port,
+        healthPath: sd.health?.path ?? this.config.defaults.healthPath,
+      });
+      first = false;
+    }
+    return keys;
   }
 
   /**
@@ -1044,6 +1677,113 @@ export class DeploymentEngine {
         // schedules a retry — the deployment stays FAILED and requires manual
         // intervention. No loops.
         this.logger.warn('auto restart failed', { deploymentId: row.id, attempt, error: String(err) });
+      }
+    }
+    await this.fireDueServiceRestarts();
+  }
+
+  /**
+   * Restart one service container of a RUNNING multi-service deployment:
+   * new container from the service image, same env/limits/network/volumes;
+   * public services get a fresh host port and a verified route update.
+   */
+  private async restartService(svc: DeploymentServiceRow, attempt: number): Promise<void> {
+    const dep = await this.deployments.byId(svc.deployment_id);
+    if (!dep || dep.status !== 'RUNNING') return;
+    const app = await this.apps.byId(dep.application_id);
+    if (!app) return;
+    const snap = parseManifestSnapshot(dep.manifest_snapshot);
+    const svcDef = snap?.services.find((sd) => sd.name === svc.service_name);
+    if (!svcDef) return;
+    const cfg = await this.resolvedConfig(app.id);
+
+    const env: Record<string, string> = { ...cfg.env, ...(svcDef.env ?? {}) };
+    for (const other of snap!.services) {
+      if (other.name === svc.service_name || !other.port) continue;
+      env[`${other.name.toUpperCase().replace(/-/g, '_')}_SERVICE_HOST`] = other.name;
+      env[`${other.name.toUpperCase().replace(/-/g, '_')}_SERVICE_PORT`] = String(other.port);
+    }
+    const isPublic = svcDef.public && !!svcDef.port;
+    let hostPort = 0;
+    if (isPublic) hostPort = await allocatePort(this.config.portRange);
+    const containerName = `minicloud-d-${svc.deployment_id.slice(0, 12)}-${svc.service_name}-${randomUUID().slice(0, 4)}`;
+    const image = svc.image_tag ?? `${dep.image_tag?.split(':')[0]}:${svc.service_name}-d-${svc.deployment_id.slice(0, 12)}`;
+
+    const started = await this.docker.startManagedContainer({
+      image,
+      name: containerName,
+      appLabel: app.id,
+      deploymentLabel: svc.deployment_id,
+      serviceLabel: svc.service_name,
+      containerPort: svcDef.port ?? 0,
+      hostPort,
+      env,
+      limits: svcDef.resources
+        ? this.dockerLimits({ memoryLimitMb: svcDef.resources.memoryLimitMb, cpuLimit: svcDef.resources.cpuLimit })
+        : {},
+      networks: [{ name: this.appNetworkName(app.id), alias: svc.service_name }],
+      volumeMounts: (svcDef.volumes ?? []).map((mount) => {
+        const [volName, target] = mount.split(':') as [string, string];
+        return { volume: this.appVolumeName(app.id, volName), target };
+      }),
+    });
+    await this.services.updateFields(svc.id, {
+      status: 'RUNNING',
+      container_id: started.id,
+      container_name: containerName,
+      host_port: hostPort || null,
+      restart_count: svc.restart_count + 1,
+      failure_reason: null,
+      exit_code: null,
+    });
+    await this.event(svc.deployment_id, SERVICE_EVENTS.recovered, `${svc.service_name} recovered (attempt ${attempt})`, {
+      serviceName: svc.service_name,
+      attempt,
+    });
+
+    // Public service of the active deployment: follow it with the gateway.
+    if (isPublic && app.active_deployment_id === svc.deployment_id && this.gateway && app.route_slug) {
+      const keys = await this.publicServiceKeys(dep, app);
+      const key = keys.find((k) => k.service === svc.service_name);
+      if (key) {
+        this.gateway.setRoute(key.key, this.upstreamFor(svc.deployment_id, hostPort) ?? { deploymentId: svc.deployment_id, host: '127.0.0.1', port: hostPort });
+        const ok = await this.gateway.verifyRoute(key.key, key.healthPath);
+        await this.event(svc.deployment_id, TRAFFIC_EVENTS.routeUpdated, `${key.key} → port ${hostPort}`, {
+          serviceName: svc.service_name,
+          verified: ok,
+        });
+      }
+    }
+  }
+
+  /** Fire due per-service automatic restarts. */
+  private async fireDueServiceRestarts(): Promise<void> {
+    const due = await this.services.listDueAutoRestarts();
+    for (const svc of due) {
+      const dep = await this.deployments.byId(svc.deployment_id);
+      if (!dep || dep.status !== 'RUNNING') {
+        await this.services.updateFields(svc.id, { next_auto_restart_at: null });
+        continue;
+      }
+      const app = await this.apps.byId(dep.application_id);
+      const snap = parseManifestSnapshot(dep.manifest_snapshot);
+      const svcDef = snap?.services.find((sd) => sd.name === svc.service_name);
+      if (!app || !svcDef || svcDef.restart !== 'on-failure' || svc.auto_restart_count >= svcDef.maxRestartAttempts) {
+        await this.services.updateFields(svc.id, { next_auto_restart_at: null });
+        continue;
+      }
+      const claimed = await this.services.claimDueAutoRestart(svc.id);
+      if (!claimed) continue;
+      const attempt = claimed.auto_restart_count;
+      try {
+        await this.restartService(claimed, attempt);
+      } catch (err) {
+        this.logger.warn('service auto restart failed', {
+          deploymentId: svc.deployment_id,
+          service: svc.service_name,
+          attempt,
+          error: String(err),
+        });
       }
     }
   }
@@ -1298,6 +2038,35 @@ export class DeploymentEngine {
         await this.deployments.transitionStatus(row.id, ['RUNNING'], 'STOPPED', undefined, { stoppedAt: new Date() });
         fixed++;
         this.logger.warn('reconciliation: retired stale non-active deployment', { deploymentId: row.id });
+      }
+    }
+
+    // Multi-service reconciliation: service containers, networks and routes.
+    if (this.gateway) {
+      const multiRows = await this.db.query<DeploymentRow>(
+        `SELECT * FROM deployments WHERE status = 'RUNNING' AND manifest_snapshot IS NOT NULL`,
+      );
+      for (const dep of multiRows.rows) {
+        const app = await this.apps.byId(dep.application_id);
+        if (!app?.route_slug) continue;
+        await this.docker.ensureNetwork(this.appNetworkName(app.id));
+        const svcRows = await this.services.listByDeployment(dep.id);
+        const isActive = app.active_deployment_id === dep.id;
+        const keys = await this.publicServiceKeys(dep, app);
+        for (const svc of svcRows) {
+          if (!svc.container_id) continue;
+          const state = await this.docker.getContainerState(svc.container_id).catch(() => null);
+          if (state === null || !state.running) {
+            // Crashed while offline: same policy-aware per-service handling.
+            await this.handleServiceCrash(svc, state);
+          } else if (isActive) {
+            const key = keys.find((k) => k.service === svc.service_name);
+            if (key) {
+              const upstream = this.upstreamFor(dep.id, svc.host_port ?? 0);
+              if (upstream) this.gateway.setRoute(key.key, upstream);
+            }
+          }
+        }
       }
     }
 
