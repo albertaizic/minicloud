@@ -85,6 +85,8 @@ export interface ApplicationRow {
   cpu_limit?: number | null;
   restart_policy: string;
   max_restart_attempts: number;
+  route_slug: string | null;
+  active_deployment_id: string | null;
 }
 
 export interface DeploymentRow {
@@ -116,7 +118,7 @@ export class AppRepository {
 
   async create(name: string, repositoryUrl: string): Promise<ApplicationRow> {
     const res = await this.db.query<ApplicationRow>(
-      'INSERT INTO applications (name, repository_url) VALUES ($1, $2) RETURNING *',
+      'INSERT INTO applications (name, repository_url, route_slug) VALUES ($1, $2, lower($1)) RETURNING *',
       [name, repositoryUrl],
     );
     return res.rows[0]!;
@@ -126,6 +128,45 @@ export class AppRepository {
   async list(): Promise<ApplicationRow[]> {
     const res = await this.db.query<ApplicationRow>('SELECT * FROM applications ORDER BY created_at DESC');
     return res.rows;
+  }
+
+  /** Gateway slug lookup (slugs are lowercase; names may not be). */
+  async bySlug(slug: string): Promise<ApplicationRow | null> {
+    const res = await this.db.query<ApplicationRow>(
+      'SELECT * FROM applications WHERE route_slug = $1',
+      [slug],
+    );
+    return res.rows[0] ?? null;
+  }
+
+  /**
+   * Point the application's traffic at a deployment. The swap is guarded on
+   * the previously-active deployment: when another operation already switched
+   * traffic (supersede), the update matches nothing and null is returned —
+   * the caller must retire itself instead of stealing traffic.
+   * expectedOld=null means "become active only when nothing is active".
+   */
+  async setActiveDeployment(
+    applicationId: string,
+    deploymentId: string,
+    expectedOld: string | null,
+  ): Promise<ApplicationRow | null> {
+    const res = await this.db.query<ApplicationRow>(
+      `UPDATE applications
+       SET active_deployment_id = $2
+       WHERE id = $1 AND active_deployment_id IS NOT DISTINCT FROM $3
+       RETURNING *`,
+      [applicationId, deploymentId, expectedOld],
+    );
+    return res.rows[0] ?? null;
+  }
+
+  /** Clear the active pointer when it references the given deployment. */
+  async clearActiveDeployment(applicationId: string, deploymentId: string): Promise<void> {
+    await this.db.query(
+      'UPDATE applications SET active_deployment_id = NULL WHERE id = $1 AND active_deployment_id = $2',
+      [applicationId, deploymentId],
+    );
   }
 
   /** Update only the restart-policy columns; limits are managed separately. */
