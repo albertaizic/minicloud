@@ -351,7 +351,10 @@ describe('automatic restart policy (real docker)', () => {
       120_000,
       'auto recovery to RUNNING:1',
     );
-    const stop = await ctx.app.inject({ method: 'POST', url: `/api/deployments/${depId}/stop` });
+    // The recovered deployment is ACTIVE: stopping it requires force.
+    const refused = await ctx.app.inject({ method: 'POST', url: `/api/deployments/${depId}/stop` });
+    expect(refused.statusCode).toBe(409);
+    const stop = await ctx.app.inject({ method: 'POST', url: `/api/deployments/${depId}/stop?force=true` });
     expect(stop.json().status).toBe('STOPPED');
 
     await new Promise((r) => setTimeout(r, 20_000));
@@ -394,7 +397,7 @@ describe('metrics (real docker)', () => {
   }, 60_000);
 
   it('refuses metrics for non-running deployments without faking zeros', async () => {
-    await ctx.app.inject({ method: 'POST', url: `/api/deployments/${depId}/stop` });
+    await ctx.app.inject({ method: 'POST', url: `/api/deployments/${depId}/stop?force=true` });
     await waitForStatus(depId, ['STOPPED']);
     const res = await ctx.app.inject({ method: 'GET', url: `/api/deployments/${depId}/metrics` });
     expect(res.statusCode).toBe(409);
@@ -467,7 +470,7 @@ describe('startup reconciliation (real docker)', () => {
     const appId = await createApp('rel-reconcile-stopped', 'hello-node');
     const depId = await deploy(appId);
     await waitForStatus(depId, ['RUNNING']);
-    await ctx.app.inject({ method: 'POST', url: `/api/deployments/${depId}/stop` });
+    await ctx.app.inject({ method: 'POST', url: `/api/deployments/${depId}/stop?force=true` });
     await waitForStatus(depId, ['STOPPED']);
 
     // Recreate the leftover container scenario: nothing should restart it.

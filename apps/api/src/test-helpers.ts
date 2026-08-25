@@ -21,14 +21,19 @@ export interface TestContext {
   dbName: string;
   engine: DeploymentEngine;
   docker: DockerRuntime;
+  /** Port the application-traffic gateway listens on for this context. */
+  gatewayPort: number;
 }
 
-export async function createTestApp(opts: { withMasterKey?: boolean } = {}): Promise<TestContext> {
+export async function createTestApp(
+  opts: { withMasterKey?: boolean; reuseDbName?: string } = {},
+): Promise<TestContext> {
   // Deterministic behavior even if the operator shell exports a real key.
   delete process.env.MINICLOUD_MASTER_KEY;
   const admin = new pg.Pool({ connectionString: ADMIN_URL });
-  const dbName = `minicloud_test_${Date.now()}_${Math.floor(Math.random() * 1e6)}`;
-  await admin.query(`CREATE DATABASE ${dbName}`);
+  const dbName =
+    opts.reuseDbName ?? `minicloud_test_${Date.now()}_${Math.floor(Math.random() * 1e6)}`;
+  if (!opts.reuseDbName) await admin.query(`CREATE DATABASE ${dbName}`);
   await admin.end();
 
   const url = ADMIN_URL.replace(/\/[^/]+$/, `/${dbName}`);
@@ -40,6 +45,8 @@ export async function createTestApp(opts: { withMasterKey?: boolean } = {}): Pro
   const engineConfig = {
     workspaceDir: path.join(os.tmpdir(), `minicloud-test-ws-${Date.now()}`),
     portRange: { start: 33000, end: 33999 },
+    gatewayPort: 36000 + Math.floor(Math.random() * 1000),
+    drainTimeoutSeconds: 2,
     defaults: {
       containerPort: 3000,
       healthPath: '/health',
@@ -58,15 +65,21 @@ export async function createTestApp(opts: { withMasterKey?: boolean } = {}): Pro
     docker,
     engine,
     engineConfig,
+    gatewayPort: engineConfig.gatewayPort,
     ...(opts.withMasterKey === false ? {} : { masterKey: TEST_MASTER_KEY }),
   });
   await app.ready();
-  return { app, db, dbName, engine, docker };
+  return { app, db, dbName, engine, docker, gatewayPort: engineConfig.gatewayPort };
+}
+
+/** Close app + pool WITHOUT dropping the database (for restart scenarios). */
+export async function closeTestContext(ctx: TestContext): Promise<void> {
+  await ctx.app.close().catch(() => {});
+  await ctx.db.close().catch(() => {});
 }
 
 export async function destroyTestContext(ctx: TestContext): Promise<void> {
-  await ctx.app.close().catch(() => {});
-  await ctx.db.close().catch(() => {});
+  await closeTestContext(ctx);
   const admin = new pg.Pool({ connectionString: ADMIN_URL });
   // Terminate remaining connections before dropping.
   await admin

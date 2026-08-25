@@ -23,7 +23,13 @@ async function main(): Promise<void> {
   };
   const engine = new DeploymentEngine(db, docker, engineConfig, logger);
 
-  const app = await buildApp({ db, docker, engine, engineConfig });
+  const app = await buildApp({
+    db,
+    docker,
+    engine,
+    engineConfig,
+    gatewayPort: Number(process.env.GATEWAY_PORT ?? 8080),
+  });
 
   // Startup reconciliation: DB vs Docker truth sync.
   try {

@@ -72,7 +72,8 @@ describe('deployment pipeline (docker)', () => {
     expect(logs.statusCode).toBe(200);
     expect(logs.json().logs.some((l: { message: string }) => /listening/.test(l.message))).toBe(true);
 
-    const stop = await ctx.app.inject({ method: 'POST', url: `/api/deployments/${depId}/stop` });
+    // The first deployment is automatically ACTIVE (v0.4): force the stop.
+    const stop = await ctx.app.inject({ method: 'POST', url: `/api/deployments/${depId}/stop?force=true` });
     expect(stop.json().status).toBe('STOPPED');
 
     // Restart brings it back to RUNNING on a fresh port.

@@ -10,12 +10,13 @@ import {
   type ApplicationRow,
   type DeploymentRow,
 } from '@minicloud/db';
-import { DockerRuntime } from '@minicloud/docker-runtime';
 import {
   DeploymentEngine,
   type EngineConfig,
   type LogListener,
 } from '@minicloud/deployment-engine';
+import { DockerRuntime } from '@minicloud/docker-runtime';
+import { Gateway, slugFromHost } from '@minicloud/gateway';
 import {
   createAppSchema,
   deployAppSchema,
@@ -41,16 +42,21 @@ export interface BuildAppOptions {
   engineConfig: EngineConfig;
   /** AES key derived from MINICLOUD_MASTER_KEY; required only for secret operations. */
   masterKey?: Buffer;
+  /** Port for the app-traffic gateway; 0/undefined disables routing. */
+  gatewayPort?: number;
 }
 
 const MAX_SSE_CLIENTS_PER_DEPLOYMENT = 50;
 
-function serializeApp(row: ApplicationRow) {
+function serializeApp(row: ApplicationRow, gatewayPort = 0) {
   return {
     id: row.id,
     name: row.name,
     repositoryUrl: row.repository_url,
     createdAt: row.created_at,
+    routeSlug: row.route_slug,
+    url: row.route_slug && gatewayPort > 0 ? `http://${row.route_slug}.localhost:${gatewayPort}` : null,
+    activeDeploymentId: row.active_deployment_id,
     limits: {
       memoryLimitMb: row.memory_limit_mb ?? null,
       cpuLimit: row.cpu_limit ?? null,
@@ -67,13 +73,14 @@ function serializeSnapshot(raw: Record<string, unknown> | null): DeploymentConfi
   return snap;
 }
 
-function serializeDeployment(row: DeploymentRow) {
+function serializeDeployment(row: DeploymentRow, opts: { isActive?: boolean } = {}) {
   return {
     id: row.id,
     applicationId: row.application_id,
     ref: row.ref,
     commitSha: row.commit_sha,
     status: row.status as DeploymentStatus,
+    isActive: opts.isActive === true,
     imageTag: row.image_tag,
     containerName: row.container_name,
     hostPort: row.host_port,
@@ -104,11 +111,34 @@ export async function buildApp(opts: BuildAppOptions): Promise<FastifyInstance> 
     bodyLimit: 64 * 1024,
   });
   const { db, docker, engine } = opts;
+  const gwPort = opts.gatewayPort ?? 0;
 
   const apps = new AppRepository(db);
   const deployments = new DeploymentRepository(db);
   const appConfig = new AppConfigRepository(db);
   const events = new DeploymentEventRepository(db);
+
+  // Application-traffic gateway: stable <slug>.localhost:<gwPort> URLs routed
+  // to the active deployment. Upstreams come only from deployment state.
+  let gateway: Gateway | null = null;
+  if (gwPort > 0) {
+    gateway = new Gateway();
+    await gateway.start(gwPort);
+    engine.setGateway(gateway);
+    // One event per consecutive upstream failure streak (never per request).
+    gateway.onUpstreamError = async (slug) => {
+      try {
+        const appRow = await apps.bySlug(slug);
+        const depId = appRow?.active_deployment_id;
+        if (appRow && depId) {
+          await events.append(depId, 'gateway.upstream_unavailable', `upstream for ${slug} unreachable`);
+        }
+      } catch { /* event persistence is best-effort */ }
+    };
+    app.addHook('onClose', async () => {
+      await gateway?.stop();
+    });
+  }
 
   // Master key: injected by tests or loaded from MINICLOUD_MASTER_KEY. An
   // absent variable means null — secrets stay disabled until configured. A
@@ -421,6 +451,29 @@ export async function buildApp(opts: BuildAppOptions): Promise<FastifyInstance> 
     return result;
   });
 
+  // ---- routing (v0.4) -------------------------------------------------------
+
+  app.get('/api/routes', async () => {
+    if (!gateway) return { gatewayPort: 0, routes: [] };
+    const snapshot = gateway.routeSnapshot();
+    const withApps = await Promise.all(
+      snapshot.map(async (r) => {
+        const appRow = await apps.bySlug(r.slug);
+        return {
+          slug: r.slug,
+          url: r.url,
+          appId: appRow?.id ?? null,
+          appName: appRow?.name ?? null,
+          deploymentId: r.deploymentId,
+          upstream: { host: r.host, port: r.port },
+          activeSince: r.activeSince,
+          stats: r.stats,
+        };
+      }),
+    );
+    return { gatewayPort: gwPort, routes: withApps };
+  });
+
   // ---- health -------------------------------------------------------------
   // ---- health -------------------------------------------------------------
   app.get('/api/health', async (_req, reply) => {
@@ -450,7 +503,7 @@ export async function buildApp(opts: BuildAppOptions): Promise<FastifyInstance> 
     }
     const created = await apps.create(name, repositoryUrl);
     req.log.info({ appId: created.id, name }, 'application created');
-    return reply.code(201).send(serializeApp(created));
+    return reply.code(201).send(serializeApp(created, gwPort));
   });
 
   app.get('/api/apps', async () => {
@@ -459,7 +512,7 @@ export async function buildApp(opts: BuildAppOptions): Promise<FastifyInstance> 
     for (const a of rows) {
       const latest = await deployments.latestForApp(a.id);
       result.push({
-        ...serializeApp(a),
+        ...serializeApp(a, gwPort),
         latestDeployment: latest
           ? { id: latest.id, status: latest.status, hostPort: latest.host_port, commitSha: latest.commit_sha, createdAt: latest.created_at }
           : null,
@@ -475,8 +528,8 @@ export async function buildApp(opts: BuildAppOptions): Promise<FastifyInstance> 
     if (!row) return reply.code(404).send({ error: 'Application not found' });
     const deps = await deployments.listByApp(id);
     return {
-      ...serializeApp(row),
-      deployments: deps.map(serializeDeployment),
+      ...serializeApp(row, gwPort),
+      deployments: deps.map((d) => serializeDeployment(d, { isActive: row.active_deployment_id === d.id })),
     };
   });
 
@@ -505,7 +558,7 @@ export async function buildApp(opts: BuildAppOptions): Promise<FastifyInstance> 
   // ---- deployments --------------------------------------------------------
   app.get('/api/deployments', async () => {
     const rows = await deployments.listAll();
-    return rows.map(serializeDeployment);
+    return rows.map((d) => serializeDeployment(d));
   });
 
   app.get('/api/deployments/:id', async (req, reply) => {
@@ -545,8 +598,20 @@ export async function buildApp(opts: BuildAppOptions): Promise<FastifyInstance> 
     if (!stoppable.includes(row.status)) {
       return reply.code(409).send({ error: `Cannot stop deployment in state ${row.status}` });
     }
-    const updated = await engine.stopDeployment(id);
-    return serializeDeployment(updated);
+    const force = (req.query as { force?: string }).force === 'true';
+    try {
+      const updated = await engine.stopDeployment(id, { force });
+      const appRow = await apps.byId(row.application_id);
+      return serializeDeployment(updated, { isActive: appRow?.active_deployment_id === id });
+    } catch (err) {
+      if (err instanceof Error && /ACTIVE deployment/.test(err.message)) {
+        return reply.code(409).send({
+          error: err.message,
+          hint: 'Pass ?force=true to stop the active deployment anyway.',
+        });
+      }
+      throw err;
+    }
   });
 
   app.delete('/api/deployments/:id', async (req, reply) => {
@@ -554,7 +619,20 @@ export async function buildApp(opts: BuildAppOptions): Promise<FastifyInstance> 
     if (!isValidId(id)) return reply.code(400).send({ error: 'Invalid deployment id' });
     const row = await deployments.byId(id);
     if (!row) return reply.code(404).send({ error: 'Deployment not found' });
-    await engine.deleteDeployment(id);
+    const bodyForce =
+      typeof req.body === 'object' && req.body !== null && (req.body as { force?: boolean }).force === true;
+    const force = (req.query as { force?: string }).force === 'true' || bodyForce;
+    try {
+      await engine.deleteDeployment(id, { force });
+    } catch (err) {
+      if (err instanceof Error && /ACTIVE deployment/.test(err.message)) {
+        return reply.code(409).send({
+          error: err.message,
+          hint: 'Pass ?force=true or {"force": true} to delete the active deployment anyway.',
+        });
+      }
+      throw err;
+    }
     return reply.code(204).send();
   });
 
