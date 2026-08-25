@@ -17,6 +17,8 @@ export interface ContainerSummary {
 export interface BuildOptions {
   contextDir: string;
   tag: string;
+  /** Repository-relative Dockerfile path (defaults to ./Dockerfile). */
+  dockerfile?: string;
   onOutput: (chunk: string) => void;
 }
 
@@ -48,10 +50,17 @@ export interface StartContainerOptions {
   name: string;
   appLabel: string;
   deploymentLabel: string;
+  /** 0 for private/worker services (no host port published). */
   containerPort: number;
   hostPort: number;
+  /** Service name for multi-service deployments (adds minicloud.service label). */
+  serviceLabel?: string;
   env?: Record<string, string>;
   limits?: ContainerResourceLimits;
+  /** MiniCloud-managed networks to join, with service aliases. */
+  networks?: Array<{ name: string; alias: string }>;
+  /** Named-volume binds: MiniCloud-generated volume name -> container path. */
+  volumeMounts?: Array<{ volume: string; target: string }>;
 }
 
 export interface ContainerStats {
@@ -123,7 +132,12 @@ export class DockerRuntime {
     try {
       stream = await this.docker.buildImage(
         { src: ['.' ], context: opts.contextDir },
-        { t: opts.tag, rm: true, forcerm: true },
+        {
+          t: opts.tag,
+          rm: true,
+          forcerm: true,
+          ...(opts.dockerfile && opts.dockerfile !== 'Dockerfile' ? { dockerfile: opts.dockerfile } : {}),
+        },
       );
     } catch (err) {
       throw wrapDockerError(err);
@@ -156,6 +170,7 @@ export class DockerRuntime {
   /** Start a managed container with MiniCloud labels and a port binding. */
   async startManagedContainer(o: StartContainerOptions): Promise<{ id: string }> {
     try {
+      const publishesPort = o.containerPort > 0 && o.hostPort > 0;
       const container = await this.docker.createContainer({
         Image: o.image,
         name: o.name,
@@ -163,13 +178,21 @@ export class DockerRuntime {
           'minicloud.managed': 'true',
           'minicloud.app': o.appLabel,
           'minicloud.deployment': o.deploymentLabel,
+          ...(o.serviceLabel ? { 'minicloud.service': o.serviceLabel } : {}),
         },
         Env: Object.entries(o.env ?? {}).map(([k, v]) => `${k}=${v}`),
-        ExposedPorts: { [`${o.containerPort}/tcp`]: {} },
+        ...(publishesPort ? { ExposedPorts: { [`${o.containerPort}/tcp`]: {} } } : {}),
         HostConfig: {
-          PortBindings: {
-            [`${o.containerPort}/tcp`]: [{ HostPort: String(o.hostPort) }],
-          },
+          ...(publishesPort
+            ? {
+                PortBindings: {
+                  [`${o.containerPort}/tcp`]: [{ HostPort: String(o.hostPort) }],
+                },
+              }
+            : {}),
+          ...(o.volumeMounts?.length
+            ? { Binds: o.volumeMounts.map((v) => `${v.volume}:${v.target}`) }
+            : {}),
           // Resource limits (cgroups). Memory is in bytes; MemorySwap == Memory
           // disables swap so the cap is hard (default would allow 2x in swap).
           // NanoCpus encodes --cpus as CPUs * 1e9. Omitted entirely when unset.
@@ -183,6 +206,12 @@ export class DockerRuntime {
         },
       });
       await container.start();
+      // Join MiniCloud-managed networks with the service alias AFTER start
+      // (dockerode connect works on running containers).
+      for (const net of o.networks ?? []) {
+        const network = this.docker.getNetwork(net.name);
+        await network.connect({ Container: container.id, EndpointConfig: { Aliases: [net.alias] } });
+      }
       return { id: container.id };
     } catch (err) {
       throw wrapDockerError(err);
@@ -196,7 +225,9 @@ export class DockerRuntime {
         filters: { label: ['minicloud.managed=true'] },
       });
       return containers.map((c) => {
-        const port = c.Ports.find((p) => p.Type === 'tcp' && p.PublicPort !== undefined);
+        // Ports is null for containers without published ports (private
+        // services / workers).
+        const port = (c.Ports ?? []).find((p) => p.Type === 'tcp' && p.PublicPort !== undefined);
         return {
           id: c.Id,
           names: c.Names,
@@ -385,6 +416,88 @@ export class DockerRuntime {
       });
       return images.map((i) => ({ id: i.Id, tags: i.RepoTags ?? [] }));
     } catch (err) {
+      throw wrapDockerError(err);
+    }
+  }
+
+  // ---- networks (MiniCloud-managed, per application) -------------------------
+
+  /** Create the network if it does not exist. Idempotent. */
+  async ensureNetwork(name: string): Promise<void> {
+    try {
+      await this.docker.getNetwork(name).inspect();
+      return; // exists
+    } catch {
+      /* fall through to create */
+    }
+    try {
+      await this.docker.createNetwork({ Name: name, Driver: 'bridge', Internal: false });
+    } catch (err) {
+      // Concurrent creation is fine; re-inspect to confirm.
+      await this.docker.getNetwork(name).inspect();
+    }
+  }
+
+  async removeNetwork(name: string): Promise<boolean> {
+    try {
+      await this.docker.getNetwork(name).inspect();
+    } catch {
+      return false;
+    }
+    try {
+      await this.docker.getNetwork(name).remove();
+      return true;
+    } catch (err) {
+      const status = (err as { statusCode?: number }).statusCode;
+      if (status === 404) return false;
+      throw wrapDockerError(err);
+    }
+  }
+
+  /** MiniCloud-managed networks (minicloud-app-*). */
+  async listMiniCloudNetworks(): Promise<{ id: string; name: string }[]> {
+    try {
+      const networks = await this.docker.listNetworks({ filters: { name: ['minicloud-app-'] } });
+      return networks
+        .filter((n) => n.Name.startsWith('minicloud-app-'))
+        .map((n) => ({ id: n.Id, name: n.Name }));
+    } catch (err) {
+      throw wrapDockerError(err);
+    }
+  }
+
+  // ---- named volumes (MiniCloud-managed, per application) --------------------
+
+  /** Create the named volume if missing. Idempotent; preserves existing data. */
+  async ensureVolume(name: string): Promise<void> {
+    try {
+      await this.docker.getVolume(name).inspect();
+      return;
+    } catch {
+      await this.docker.createVolume({ Name: name, Driver: 'local' });
+    }
+  }
+
+  /** MiniCloud-managed volumes (minicloud-*). Never removed by prune. */
+  async listMiniCloudVolumes(): Promise<{ name: string }[]> {
+    try {
+      const vols = await this.docker.listVolumes({ filters: { name: ['minicloud-'] } });
+      return (vols.Volumes ?? [])
+        .filter((v) => v.Name.startsWith('minicloud-'))
+        .map((v) => ({ name: v.Name }));
+    } catch (err) {
+      throw wrapDockerError(err);
+    }
+  }
+
+  /** DANGEROUS: only used by explicit application deletion with volumes. */
+  async removeVolume(name: string): Promise<boolean> {
+    try {
+      await this.docker.getVolume(name).remove();
+      return true;
+    } catch (err) {
+      const status = (err as { statusCode?: number }).statusCode;
+      if (status === 404) return false;
       throw wrapDockerError(err);
     }
   }
