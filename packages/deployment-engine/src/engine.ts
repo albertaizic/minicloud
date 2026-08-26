@@ -58,6 +58,9 @@ export interface EngineConfig {
   /** Max seconds to wait for in-flight requests before retiring the old
    *  container after a cutover. */
   drainTimeoutSeconds?: number;
+  /** Hard ceiling for a single image build; protects queue slots from a
+   *  hung docker build. Default 900s. */
+  buildTimeoutSeconds?: number;
 }
 
 /**
@@ -633,16 +636,19 @@ export class DeploymentEngine {
           fingerprint: fingerprint.slice(0, 16),
         });
         try {
-          await this.docker.build({
-            contextDir: repoDir!,
-            tag: deploymentTag,
-            signal: abort.signal,
-            onOutput: (chunk) => {
-              for (const line of chunk.split(/\r?\n/)) {
-                if (line.trim()) this.emitLog(deploymentId, { source: 'build', stream: 'stdout', message: line });
-              }
-            },
-          });
+          await this.withBuildTimeout(
+            this.docker.build({
+              contextDir: repoDir!,
+              tag: deploymentTag,
+              signal: abort.signal,
+              onOutput: (chunk) => {
+                for (const line of chunk.split(/\r?\n/)) {
+                  if (line.trim()) this.emitLog(deploymentId, { source: 'build', stream: 'stdout', message: line });
+                }
+              },
+            }),
+            abort,
+          );
           await this.artifacts.record({
             applicationId: app.id,
             commitSha,
@@ -1355,17 +1361,20 @@ export class DeploymentEngine {
             imageTag: tag,
           });
           try {
-            await this.docker.build({
-              contextDir: path.resolve(repoDir, svcDef.context),
-              tag,
-              dockerfile: dockerfileInContext,
-              signal: abort.signal,
-              onOutput: (chunk) => {
-                for (const line of chunk.split(/\r?\n/)) {
-                  if (line.trim()) this.emitLog(deploymentId, { source: 'build', stream: 'stdout', message: line });
-                }
-              },
-            });
+            await this.withBuildTimeout(
+              this.docker.build({
+                contextDir: path.resolve(repoDir, svcDef.context),
+                tag,
+                dockerfile: dockerfileInContext,
+                signal: abort.signal,
+                onOutput: (chunk) => {
+                  for (const line of chunk.split(/\r?\n/)) {
+                    if (line.trim()) this.emitLog(deploymentId, { source: 'build', stream: 'stdout', message: line });
+                  }
+                },
+              }),
+              abort,
+            );
             builtCount++;
             await this.artifacts.record({
               applicationId: app.id,
@@ -2498,6 +2507,29 @@ export class DeploymentEngine {
     return { fixed, orphansRemoved };
   }
 
+  /**
+   * Bound any single image build. A hung docker build must never hold a queue
+   * slot forever: on expiry the build signal aborts (tearing down the output
+   * stream) and the pipeline fails with a clear reason, freeing the worker.
+   */
+  private withBuildTimeout(build: Promise<unknown>, abort: AbortController): Promise<unknown> {
+    const seconds = this.config.buildTimeoutSeconds ?? 900;
+    let timer: NodeJS.Timeout | undefined;
+    const expiry = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => {
+        abort.abort();
+        reject(new EngineError(`docker build timed out after ${seconds}s`, 'build'));
+      }, seconds * 1000);
+    });
+    return Promise.race([
+      build.then(
+        (v) => { clearTimeout(timer); return v; },
+        (e) => { clearTimeout(timer); throw e; },
+      ),
+      expiry,
+    ]);
+  }
+
   private async transition(
     deploymentId: string,
     _from: DeploymentStatus | null,
@@ -2532,6 +2564,7 @@ export function defaultEngineConfigFromEnv(): EngineConfig {
     },
     gatewayPort: Number(process.env.GATEWAY_PORT ?? 0),
     drainTimeoutSeconds: Number(process.env.GATEWAY_DRAIN_TIMEOUT_SECONDS ?? 10),
+    buildTimeoutSeconds: Number(process.env.MINICLOUD_BUILD_TIMEOUT_SECONDS ?? 900),
   };
 }
 
