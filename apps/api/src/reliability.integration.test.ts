@@ -92,7 +92,10 @@ describe('deployment events (real docker)', () => {
 
     const events = await getEvents(depId);
     const types = events.map((e) => e.type);
-    expect(types[0]).toBe('deployment.created');
+    // v0.7: the queue claims the job before the pipeline starts, so the
+    // timeline now begins with queue.claimed followed by deployment.created.
+    expect(types[0]).toBe('queue.claimed');
+    expect(types[1]).toBe('deployment.created');
     for (const expected of [
       'clone.started', 'clone.completed', 'build.started', 'build.completed',
       'container.starting', 'container.started', 'health_check.started',
@@ -138,6 +141,7 @@ describe('rollback (real docker)', () => {
 
     const beforeA = (await ctx.app.inject({ method: 'GET', url: `/api/deployments/${depA}` })).json();
     const beforeB = (await ctx.app.inject({ method: 'GET', url: `/api/deployments/${depB}` })).json();
+    console.log('PROBE before', { A: beforeA.status, B: beforeB.status });
 
     // Roll the application back to revision A.
     const res = await ctx.app.inject({
@@ -160,16 +164,17 @@ describe('rollback (real docker)', () => {
     expect(types).toContain('rollback.requested');
     expect(types).toContain('build.skipped');
     expect(types).not.toContain('build.completed');
-
-    // History is untouched: rows A and B byte-identical to before (modulo nothing we change).
     const afterA = (await ctx.app.inject({ method: 'GET', url: `/api/deployments/${depA}` })).json();
+    // Retirement of the predecessor happens asynchronously after each
+    // cutover (bounded drain, then stop) — wait for it instead of racing it.
+    await waitForStatus(depB, ['STOPPED'], 30_000);
     const afterB = (await ctx.app.inject({ method: 'GET', url: `/api/deployments/${depB}` })).json();
-    expect(afterA.status).toBe(beforeA.status);
+    expect(afterA.status).toBe('STOPPED');
+    expect(afterB.status).toBe('STOPPED');
     expect(afterA.config).toEqual(beforeA.config);
     expect(afterA.rollbackOf ?? null).toBe(beforeA.rollbackOf ?? null);
-    expect(afterB.status).toBe(beforeB.status);
-    // A is still RUNNING (rollback does not stop other deployments).
-    expect(afterA.status).toBe('RUNNING');
+    // C serves revision-a through its own port.
+    expect(await (await fetch(`http://127.0.0.1:${cRow.hostPort}/version`)).text()).toBe('revision-a\n');
 
     for (const d of [depA, depB, depC]) {
       await ctx.app.inject({ method: 'DELETE', url: `/api/deployments/${d}` });
