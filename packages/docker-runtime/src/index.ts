@@ -156,11 +156,9 @@ export class DockerRuntime {
       // lag the actual build end by ~45s. The tagged image appearing IS the
       // authoritative completion signal — poll for it and resolve early.
       poll = setInterval(() => {
+        // Tag present = build finished; don't wait for stream EOF.
         this.docker.getImage(opts.tag).inspect()
-          .then((info) => {
-            const id: string = info.Id;
-            settle(() => resolve({ imageId: id }));
-          })
+          .then(() => settle(() => resolve()))
           .catch(() => { /* not built yet */ });
       }, 500);
       const onAbort = () => {
