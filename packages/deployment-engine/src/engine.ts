@@ -1689,6 +1689,7 @@ export class DeploymentEngine {
       const fresh = await this.apps.byId(app.id);
       if (!fresh) return;
       const current = fresh.active_deployment_id;
+      this.logger.warn('ACTIVATE-MULTI', { deploymentId: short(deploymentId), expectedOld: expectedOld ? short(expectedOld) : null, current: current ? short(current) : null });
       if (current === deploymentId) return;
       if (current !== expectedOld) {
         await this.event(deploymentId, TRAFFIC_EVENTS.superseded, `traffic moved to ${short(current ?? '?')}`);

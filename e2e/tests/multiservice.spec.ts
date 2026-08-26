@@ -37,9 +37,11 @@ test.describe.serial('multi-service + zero-downtime UI (real stack)', () => {
 
     // Deploy B through the UI while watching A's active status.
     await page.getByRole('button', { name: /deploy again/i }).click();
-    const depLink = page.locator('tbody a').first();
-    await expect(depLink).toBeVisible({ timeout: 30_000 });
-    const newDepHref = await depLink.getAttribute('href');
+    // Bind to the NEWLY CREATED deployment, never the stale first row: the
+    // table refresh can lag the click and still show A on top.
+    const newLink = page.locator('tbody a').filter({ hasNotText: depA.slice(0, 8) }).first();
+    await expect(newLink).toBeVisible({ timeout: 60_000 });
+    const newDepHref = await newLink.getAttribute('href');
     depB = newDepHref!.split('/').pop()!;
 
     // While B builds, A keeps serving. Cached layers can finish B quickly, so
