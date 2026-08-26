@@ -11,6 +11,8 @@ const VITE = path.join(ROOT, 'node_modules', 'vite', 'bin', 'vite.js');
 
 export default defineConfig({
   testDir: './tests',
+  globalSetup: './helpers/global-setup.mjs',
+  globalTeardown: './helpers/global-teardown.mjs',
   timeout: 600_000,
   expect: { timeout: 15_000 },
   fullyParallel: false,
@@ -33,7 +35,7 @@ export default defineConfig({
       env: { PORT: '4555' },
     },
     {
-      command: `node -e "const{execFileSync}=require('child_process');try{execFileSync('docker',['exec','minicloud-postgres','psql','-U','minicloud','-c','DROP DATABASE IF EXISTS minicloud_e2e'],{stdio:'pipe'})}catch{}try{execFileSync('docker',['exec','minicloud-postgres','psql','-U','minicloud','-c','CREATE DATABASE minicloud_e2e'],{stdio:'pipe'})}catch(e){console.error(e.message)}" && node "${TSX}" apps/api/src/main.ts`,
+      command: `node "${TSX}" apps/api/src/main.ts`,
       port: API_PORT,
       reuseExistingServer: false,
       cwd: ROOT,

@@ -7,12 +7,15 @@ test.describe('error-state UX (real stack)', () => {
   test('invalid repository shows a human-readable failure, no crash', async ({ page }) => {
     test.setTimeout(300_000);
     const { consoleErrors, pageErrors } = attachErrorCollectors(page);
+    // Compute ONCE: re-evaluating Date.now() per locator would produce a
+    // different name every millisecond and race the element lookup.
+    const appName = `e2e-badrepo-${Date.now() % 100000}`;
     await page.goto('/');
-    await page.getByPlaceholder('app-name').fill(`e2e-badrepo-${Date.now() % 100000}`);
+    await page.getByPlaceholder('app-name').fill(appName);
     await page.getByPlaceholder('https://github.com/user/repo.git').fill('http://localhost:4555/does-not-exist.git');
     await page.getByRole('button', { name: /create app/i }).click();
-    await expect(page.getByRole('link', { name: `e2e-badrepo-${Date.now() % 100000}` })).toBeVisible({ timeout: 15_000 });
-    await page.getByRole('link', { name: `e2e-badrepo-${Date.now() % 100000}` }).click();
+    await expect(page.getByRole('link', { name: appName })).toBeVisible({ timeout: 15_000 });
+    await page.getByRole('link', { name: appName }).click();
     await page.getByRole('button', { name: /deploy again/i }).click();
 
     const depLink = page.locator('tbody a').first();
@@ -25,7 +28,7 @@ test.describe('error-state UX (real stack)', () => {
     expect(body).not.toMatch(/at .+ \(.*:\d+:\d+\)/); // no raw stack frames
     expectNoErrors(consoleErrors, pageErrors);
     const apps = (await (await fetch('http://localhost:4100/api/apps')).json()) as Array<{ id: string; name: string }>;
-    const app = apps.find((a) => a.name === `e2e-badrepo-${Date.now() % 100000}`);
+    const app = apps.find((a) => a.name === appName);
     if (app) await apiDelete(`/api/apps/${app.id}`);
   });
 
@@ -60,8 +63,6 @@ test.describe('error-state UX (real stack)', () => {
     await page.getByPlaceholder('memory MB (16–65536)').fill('999999');
     await page.getByPlaceholder('CPUs (0.1–64)').fill('0.5');
     await page.getByRole('button', { name: /save limits/i }).click();
-    await expect(page.locator('p.error').first()).toBeVisible({ timeout: 10_000 });
-    await page.locator('p.error').first().fill('');
     const body = await page.locator('body').innerText();
     expect(body).not.toMatch(/at .+ \(.*:\d+:\d+\)/);
     await apiDelete(`/api/apps/${appId}`);

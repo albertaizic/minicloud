@@ -16,7 +16,7 @@ export default async function globalTeardown() {
     }
     execFileSync(
       'docker',
-      ['exec', 'minicloud-postgres', 'psql', '-U', 'minicloud', '-c', 'DROP DATABASE IF EXISTS minicloud_e2e'],
+      ['exec', 'minicloud-postgres', 'psql', '-U', 'minicloud', '-c', 'DROP DATABASE IF EXISTS minicloud_e2e WITH (FORCE)'],
       { stdio: 'pipe', timeout: 15_000 },
     );
   } catch (e) {

@@ -124,14 +124,14 @@ test.describe.serial('configuration UI (env, secrets, limits, policy)', () => {
   test('restart policy: set, persist across reload, invalid values rejected', async ({ page }) => {
     await page.goto(`/apps/${appId}`);
     await page.locator('select').selectOption('on-failure');
-    await page.locator('input[type="number"]').last().fill('4');
+    await page.getByLabel('max restart attempts').fill('4');
     await page.getByRole('button', { name: /save policy/i }).click();
     await expect(page.getByText('saved')).toBeVisible({ timeout: 10_000 });
 
     // Reload: UI state consistent.
     await page.reload();
     await expect(page.locator('select')).toHaveValue('on-failure');
-    await expect(page.locator('input[type="number"]').last()).toHaveValue('4');
+    await expect(page.getByLabel('max restart attempts')).toHaveValue('4');
 
     // API agrees.
     expect(await apiGet(`/api/apps/${appId}/restart-policy`)).toEqual({
@@ -139,7 +139,7 @@ test.describe.serial('configuration UI (env, secrets, limits, policy)', () => {
     });
 
     // Invalid attempt count is rejected with a visible error, no crash.
-    await page.locator('input[type="number"]').last().fill('99');
+    await page.getByLabel('max restart attempts').fill('99');
     await page.getByRole('button', { name: /save policy/i }).click();
     await expect(page.locator('p.error')).toBeVisible();
     await page.reload();

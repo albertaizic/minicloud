@@ -46,8 +46,12 @@ export async function waitForDeploymentStatus(
   }
 }
 
-/** Create an app + deploy through the API (dashboard asserts the UI side). */
-export async function deployViaApi(name: string, repoUrl: string, ref?: string): Promise<string> {
+/** Find-or-create an application by name: fixture isolation that tolerates
+ *  leftover state from a previous run without masking real API failures. */
+export async function ensureApp(name: string, repoUrl: string): Promise<string> {
+  const apps = (await apiGet('/api/apps')) as Array<{ id: string; name: string }>;
+  const existing = apps.find((a) => a.name === name);
+  if (existing) return existing.id;
   const res = await fetch(`${API}/api/apps`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
@@ -55,7 +59,13 @@ export async function deployViaApi(name: string, repoUrl: string, ref?: string):
   });
   const app = await res.json();
   if (!res.ok || !app.id) throw new Error(`create app failed: ${JSON.stringify(app)}`);
-  const dres = await fetch(`${API}/api/apps/${app.id}/deploy`, {
+  return app.id as string;
+}
+
+/** Create (or reuse) an app + deploy through the API (dashboard asserts the UI side). */
+export async function deployViaApi(name: string, repoUrl: string, ref?: string): Promise<string> {
+  const appId = await ensureApp(name, repoUrl);
+  const dres = await fetch(`${API}/api/apps/${appId}/deploy`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify(ref ? { ref } : {}),

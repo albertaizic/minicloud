@@ -9,7 +9,7 @@ export default async function globalSetup() {
 
   docker(['exec', 'minicloud-postgres', 'psql', '-U', 'minicloud', '-c',
     `SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '${DB}' AND pid <> pg_backend_pid()`]);
-  docker(['exec', 'minicloud-postgres', 'psql', '-U', 'minicloud', '-c', `DROP DATABASE IF EXISTS ${DB}`]);
+  docker(['exec', 'minicloud-postgres', 'psql', '-U', 'minicloud', '-c', `DROP DATABASE IF EXISTS ${DB} WITH (FORCE)`]);
   docker(['exec', 'minicloud-postgres', 'psql', '-U', 'minicloud', '-c', `CREATE DATABASE ${DB}`]);
 
   // Apply migrations via the project's own runner.

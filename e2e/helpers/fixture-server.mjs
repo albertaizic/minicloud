@@ -24,6 +24,14 @@ const specs = [
       path.resolve(process.cwd(), 'examples/msvc-b'),
     ],
   },
+  {
+    // Two content revisions so PR synchronize can flip the served version.
+    name: 'rev',
+    revisions: [
+      path.resolve(process.cwd(), 'examples/rev-app-a'),
+      path.resolve(process.cwd(), 'examples/rev-app-b'),
+    ],
+  },
 ];
 
 for (const spec of specs) {
