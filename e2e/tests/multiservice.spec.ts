@@ -131,12 +131,11 @@ test.describe.serial('multi-service + zero-downtime UI (real stack)', () => {
     // Cutover back to A completes asynchronously — wait for the pointer.
     let rolledBack = false;
     for (let i = 0; i < 240; i++) {
-      const appRow = (await apiGet(`/api/apps/${appId}`)) as { activeDeploymentId?: string };
+      const appRow = (await apiGet(`/api/apps/${appId}`)) as { activeDeploymentId?: string; deployments: Array<{ id: string; status: string; isActive: boolean; rollbackOf: string | null }> };
       if (appRow.activeDeploymentId === depA) { rolledBack = true; break; }
       await new Promise((r) => setTimeout(r, 500));
     }
     expect(rolledBack).toBe(true);
-
     // Version back to A; the volume counter NOT reset.
     const home = await appUrl('e2e-msvc');
     const parsed = JSON.parse(home.body) as { version: string; api: { count: number } };
