@@ -11,6 +11,7 @@ export default function DeploymentDetail() {
   const [dep, setDep] = useState<Awaited<ReturnType<typeof api.getDeployment>> | null>(null);
   const [appName, setAppName] = useState('');
   const [error, setError] = useState('');
+  const [confirmForceStop, setConfirmForceStop] = useState(false);
 
   const load = useCallback(() => {
     if (!id) return;
@@ -86,7 +87,19 @@ export default function DeploymentDetail() {
       </div>
       <div className="actions">
         <button onClick={() => act(() => api.restart(dep.id))}>Restart</button>
-        <button onClick={() => act(() => api.stop(dep.id))}>Stop</button>
+        {dep.isActive ? (
+          confirmForceStop ? (
+            <>
+              <span className="error-text">Stopping the ACTIVE deployment makes this application unavailable. </span>
+              <button className="primary" onClick={() => { setConfirmForceStop(false); void act(() => api.stop(dep.id, { force: true })); }}>Confirm force stop</button>
+              <button onClick={() => setConfirmForceStop(false)}>Cancel</button>
+            </>
+          ) : (
+            <button onClick={() => setConfirmForceStop(true)}>Stop</button>
+          )
+        ) : (
+          <button onClick={() => act(() => api.stop(dep.id, { force: true }))}>Stop</button>
+        )}
       </div>
       {error && <p className="error">{error}</p>}
       {dep.services && dep.services.length > 0 && (

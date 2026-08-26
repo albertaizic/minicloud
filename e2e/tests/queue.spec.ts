@@ -111,12 +111,17 @@ test.describe.serial('queue & preview UI (v0.7)', () => {
     test.setTimeout(420_000);
     const dres = await fetch(`${API}/api/apps/${appId}/deploy`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' });
     const body = (await dres.json()) as { deployment: { id: string } };
+    // Reach RUNNING via the API first: the page's metrics note also contains
+    // the word RUNNING when queued, which would match too early.
+    for (let i = 0; i < 300; i++) {
+      const d = (await apiGet(`/api/deployments/${body.deployment.id}`)) as { status: string };
+      if (d.status === 'RUNNING') break;
+      await new Promise((r) => setTimeout(r, 1000));
+    }
     await page.goto(`/deployments/${body.deployment.id}`);
-    await expect(page.getByRole('heading', { name: /deployment/i })).toBeVisible();
-    // Either an early state badge or RUNNING must appear; then it settles RUNNING.
-    await expect(page.getByText(/RUNNING/i).first()).toBeVisible({ timeout: 300_000 });
-    // Build cache line renders for real builds (miss on first build).
-    await expect(page.getByText(/built from Dockerfile|reused image/i).first()).toBeVisible({ timeout: 30_000 });
+    await expect(page.locator('.detail-grid .badge', { hasText: /running/i })).toBeVisible({ timeout: 30_000 });
+    // Build cache line renders for real builds and exact reuse alike.
+    await expect(page.getByText(/built from Dockerfile|reused image/i).first()).toBeVisible({ timeout: 60_000 });
   });
 
   test('preview lifecycle: open → URL works → synchronize flips version → close cleans up', async ({ page }) => {
