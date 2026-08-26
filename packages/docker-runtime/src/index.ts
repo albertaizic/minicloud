@@ -146,6 +146,20 @@ export class DockerRuntime {
     }
     let lastErrors = '';
     await new Promise<void>((resolve, reject) => {
+      let poll: NodeJS.Timeout | undefined;
+      const settle = (fn: () => void) => {
+        clearInterval(poll);
+        opts.signal?.removeEventListener('abort', onAbort);
+        fn();
+      };
+      // Windows named-pipe quirk: followProgress' completion callback can
+      // lag the actual build end by ~45s. The tagged image appearing IS the
+      // authoritative completion signal — poll for it and resolve early.
+      poll = setInterval(() => {
+        this.docker.getImage(opts.tag).inspect()
+          .then((info: { Id: string }) => settle(() => resolve({ imageId: info.Id })))
+          .catch(() => { /* not built yet */ });
+      }, 500);
       const onAbort = () => {
         try {
           // Closing the response stream cancels the client side of the build.
@@ -161,11 +175,11 @@ export class DockerRuntime {
       this.docker.modem.followProgress(
         stream,
         (err: Error | null) => {
-          opts.signal?.removeEventListener('abort', onAbort);
-          if (err) reject(wrapDockerError(err));
-          else if (lastErrors.trim()) {
-            reject(new Error(normalizeBuildError(lastErrors)));
-          } else resolve();
+          settle(() => {
+            if (err) reject(wrapDockerError(err));
+            else if (lastErrors.trim()) reject(new Error(normalizeBuildError(lastErrors)));
+            else resolve();
+          });
         },
         (event: { stream?: string; errorDetail?: { message?: string }; error?: string }) => {
           if (event.stream) opts.onOutput?.(event.stream);
