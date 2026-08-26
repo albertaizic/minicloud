@@ -69,7 +69,7 @@ for (const spec of specs) {
   const count = spec.revisions ? spec.revisions.length : 1;
   const out = execFileSync(
     'git',
-    ['log', '--format=%H', `-n${count}`, '--reverse', 'main'],
+    ['log', '--format=%H', `-n${count}`, '--reverse', 'HEAD'],
     { cwd: path.join(root, `work-${spec.name}`) },
   );
   shas[spec.name] = out.toString().trim().split('\n').filter(Boolean);
