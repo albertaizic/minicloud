@@ -73,7 +73,7 @@ test.describe.serial('reliability UI flows (real stack)', () => {
 
     // Restart count visible in the deployment detail.
     await page.goto(`/deployments/${depId}`);
-    await expect(page.getByText(/restarts/i)).toBeVisible();
+    await expect(page.getByText('Restarts', { exact: true })).toBeVisible();
     const dep = (await apiGet(`/api/deployments/${depId}`)) as { restartCount: number };
     expect(dep.restartCount).toBe(1);
   });

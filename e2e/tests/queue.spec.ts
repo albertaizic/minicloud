@@ -201,8 +201,10 @@ test.describe.serial('queue & preview UI (v0.7)', () => {
     expect(close.status).toBe(200);
     const goneAfterClose = await requestThroughGateway(8080, `pr-7-${previewSlug}.localhost`);
     expect(goneAfterClose.status).toBe(503);
-
-    await page.goto(`/apps/${previewAppId}`);
-    await expect(page.locator('tr', { hasText: 'PR #7' }).first().getByText(/closed/i)).toBeVisible({ timeout: 30_000 });
+    // The panel moves the environment to the collapsed "closed" section; the
+    // authoritative state comes from the API.
+    const closedEnv = (await apiGet(`/api/apps/${previewAppId}/previews`)) as { previews: Array<{ prNumber: number; status: string }> };
+    expect(closedEnv.previews.find((p) => p.prNumber === 7)?.status).toBe('closed');
+    await expect(page.getByText(/closed preview/i)).toBeVisible({ timeout: 30_000 });
   });
 });

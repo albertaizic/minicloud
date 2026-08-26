@@ -15,8 +15,9 @@ export default defineConfig({
   timeout: 600_000,
   expect: { timeout: 15_000 },
   fullyParallel: false,
-  workers: 1,
-  retries: process.env.CI ? 1 : 0,
+  // No retries: a rerun deploys over the previous attempt's state (same app
+  // fixtures) and stomps it mid-assertions. Gates must pass first-try.
+  retries: 0,
   reporter: [['list'], ['html', { outputFolder: path.join(ROOT, 'e2e-artifacts', 'report'), open: 'never' }]],
   use: {
     baseURL: `http://localhost:${DASH_PORT}`,
