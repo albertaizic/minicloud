@@ -86,8 +86,23 @@ test.describe.serial('reliability UI flows (real stack)', () => {
 
     await page.goto(`/deployments/${depId}`);
     // The crash + recovery timeline appears; deployment returns to RUNNING.
-    await expect(page.locator('table').getByText('container.crashed').first()).toBeVisible({ timeout: 120_000 });
-    await expect(page.locator('table').getByText('restart.auto_succeeded').first()).toBeVisible({ timeout: 120_000 });
+    let lastErr = '';
+    try {
+      await expect(page.locator('table').getByText('container.crashed').first()).toBeVisible({ timeout: 120_000 });
+      await expect(page.locator('table').getByText('restart.auto_succeeded').first()).toBeVisible({ timeout: 120_000 });
+    } catch (e) {
+      lastErr = String(e);
+      const dep = await apiGet(`/api/deployments/${depId}`);
+      const ev = await apiGet(`/api/deployments/${depId}/events`);
+      const pol = await apiGet(`/api/apps/${appId}/restart-policy`);
+      console.log('PROBE-RECOVERY', JSON.stringify({
+        status: dep.status, failureReason: dep.failureReason,
+        policy: pol, autoRestartCount: dep.autoRestartCount,
+        nextDue: dep.nextAutoRestartAt ?? null,
+        events: ev.events.map((x: { type: string }) => x.type),
+      }));
+      throw e;
+    }
     await expect(page.getByText('RUNNING').first()).toBeVisible({ timeout: 60_000 });
     const served = await appUrl('e2e-rel', '/health');
     expect(served.status).toBe(200);
