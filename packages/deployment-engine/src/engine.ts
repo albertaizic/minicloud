@@ -104,7 +104,10 @@ export interface ResolvedAppConfig {
   limits: ResourceLimits | null;
 }
 
-export type AppConfigResolver = (applicationId: string) => Promise<ResolvedAppConfig>;
+export type AppConfigResolver = (
+  applicationId: string,
+  opts: { previewEnvironmentId?: string | null },
+) => Promise<ResolvedAppConfig>;
 
 /** Canonical deployment event types (persisted to deployment_events). */
 export const DEPLOYMENT_EVENTS = {
@@ -375,10 +378,13 @@ export class DeploymentEngine {
   }
 
   /** Resolve config, mapping any resolver failure to EngineError(stage='config'). */
-  private async resolvedConfig(applicationId: string): Promise<ResolvedAppConfig> {
+  private async resolvedConfig(
+    applicationId: string,
+    opts: { previewEnvironmentId?: string | null } = {},
+  ): Promise<ResolvedAppConfig> {
     if (!this.appConfigResolver) return { env: {}, secretKeys: [], limits: null };
     try {
-      return await this.appConfigResolver(applicationId);
+      return await this.appConfigResolver(applicationId, opts);
     } catch (err) {
       throw new EngineError(err instanceof Error ? err.message : String(err), 'config');
     }
@@ -684,7 +690,7 @@ export class DeploymentEngine {
     // snapshot records plain values and secret KEY NAMES only.
     let cfg: ResolvedAppConfig;
     try {
-      cfg = await this.resolvedConfig(app.id);
+      cfg = await this.resolvedConfig(app.id, { previewEnvironmentId: previewEnvId });
     } catch (err) {
       await fail('config', err instanceof Error ? err.message : String(err));
       await repoCleanup(repoDir);
@@ -1367,7 +1373,7 @@ export class DeploymentEngine {
       // Effective app configuration (env/secrets/limits) once for all services.
       let cfg: ResolvedAppConfig;
       try {
-        cfg = await this.resolvedConfig(app.id);
+        cfg = await this.resolvedConfig(app.id, { previewEnvironmentId: previewEnvId });
       } catch (err) {
         await fail('config', err instanceof Error ? err.message : String(err));
         if (repoDir) await repoCleanup(repoDir);

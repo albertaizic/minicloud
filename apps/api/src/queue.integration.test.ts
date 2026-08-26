@@ -63,7 +63,7 @@ describe('persistent deployment queue (real docker)', () => {
   it('manual deploys run through the queue to RUNNING with a completed job', async () => {
     const q = queueOf(ctx.app);
     const appId = await createApp(ctx, `q-basic-${Date.now() % 100000}`, fixtures.url('hello-node'));
-    const { deploymentId } = await q.createAndEnqueue(appId, { trigger: 'manual', desiredRef: 'HEAD' });
+    const { deploymentId, jobId } = await q.createAndEnqueue(appId, { trigger: 'manual', desiredRef: 'HEAD' });
     // Scheduler is not started yet in tests; drive one claim explicitly.
     expect((await ctx.app.inject({ method: 'GET', url: `/api/queue` })).json().queued.length).toBeGreaterThan(0);
     q.start();

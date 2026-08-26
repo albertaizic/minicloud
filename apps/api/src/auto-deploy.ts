@@ -130,7 +130,14 @@ async function handlePullRequest(
 
   // opened / reopened / synchronize → deploy or replace the preview.
   const headSha = payload.pull_request?.head?.sha ?? null;
-  if (!headSha) return { handled: false, detail: 'missing head sha' };
+  // GitHub always sends a full object id; anything else is rejected before it
+  // can become a git argument (defence against option-style values).
+  if (!headSha || !/^[0-9a-f]{40}$/i.test(headSha)) {
+    return { handled: false, detail: 'missing or malformed head sha' };
+  }
+  if (!Number.isInteger(prNumber) || prNumber <= 0 || prNumber > 2_147_483_647) {
+    return { handled: false, detail: 'malformed pr number' };
+  }
   const branch = payload.pull_request?.head?.ref ?? null;
   const app = await deps.apps.byId(appId);
   if (!app) return { handled: false, detail: 'application vanished' };

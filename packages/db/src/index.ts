@@ -93,6 +93,7 @@ export interface ApplicationRow {
   last_deployed_sha: string | null;
   last_git_check: string | null;
   webhook_secret: string | null;
+  secrets_in_previews: boolean;
 }
 
 export interface DeploymentRow {
