@@ -169,7 +169,7 @@ test.describe.serial('queue & preview UI (v0.7)', () => {
     await expect(page.getByRole('heading', { name: /preview environments/i })).toBeVisible();
     const row = page.locator('tr', { hasText: 'PR #7' }).first();
     await expect(row).toBeVisible({ timeout: 30_000 });
-    await expect(row.getByText(/PREVIEW/i)).toBeVisible();
+    await expect(row.getByText('PREVIEW', { exact: true })).toBeVisible();
 
     // Wait healthy; URL must serve revision content.
     for (let i = 0; i < 240; i++) {

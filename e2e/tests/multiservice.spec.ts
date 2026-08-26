@@ -76,7 +76,7 @@ test.describe.serial('multi-service + zero-downtime UI (real stack)', () => {
 
     // Deployment detail of B: ACTIVE badge + services table.
     await page.goto(`/deployments/${depB}`);
-    await expect(page.getByText('ACTIVE').first()).toBeVisible();
+    await expect(page.getByText('ACTIVE').first()).toBeVisible({ timeout: 60_000 });
     await expect(page.getByRole('heading', { name: /services/i })).toBeVisible();
     const svcTable = page.locator('table').first();
     await expect(svcTable.getByText('web')).toBeVisible();

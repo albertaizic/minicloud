@@ -1097,6 +1097,30 @@ export class DeploymentEngine {
           { hostPort, verified: ok },
         );
       }
+      // Manual restart of an OFFLINE app (no active pointer, no other RUNNING
+      // revision) brings it back online at the stable URL. Automatic recovery
+      // and apps that still serve elsewhere never steal traffic here.
+      const freshApp = await this.apps.byId(app.id);
+      const othersRunning = freshApp?.active_deployment_id
+        ? null
+        : await this.db.query(
+            "SELECT id FROM deployments WHERE application_id = $1 AND status = 'RUNNING' AND id <> $2 LIMIT 1",
+            [app.id, deploymentId],
+          );
+      if (!automatic && freshApp && !freshApp.active_deployment_id && othersRunning && othersRunning.rows.length === 0) {
+        const swappedBack = await this.apps.setActiveDeployment(app.id, deploymentId, null);
+        if (swappedBack && this.gateway && app.route_slug) {
+          const restoredUpstream = this.upstreamFor(deploymentId, hostPort);
+          if (restoredUpstream) this.gateway.setRoute(app.route_slug, restoredUpstream);
+          const verified = await this.gateway.verifyRoute(app.route_slug, healthPath);
+          await this.event(
+            deploymentId,
+            TRAFFIC_EVENTS.routeUpdated,
+            verified ? `${app.route_slug} restored by restart` : 'route restore unverified',
+            { hostPort, verified },
+          );
+        }
+      }
       return finalRow ?? (await this.deployments.byId(deploymentId))!;
     });
   }
