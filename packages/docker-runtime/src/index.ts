@@ -17,9 +17,11 @@ export interface ContainerSummary {
 export interface BuildOptions {
   contextDir: string;
   tag: string;
-  /** Repository-relative Dockerfile path (defaults to ./Dockerfile). */
   dockerfile?: string;
-  onOutput: (chunk: string) => void;
+  onOutput?: (chunk: string) => void;
+  /** Aborting rejects the build promise and tears down the output stream.
+   *  The daemon may finish already-started layers, but no tag is applied. */
+  signal?: AbortSignal;
 }
 
 export class DockerUnavailableError extends Error {
@@ -142,19 +144,31 @@ export class DockerRuntime {
     } catch (err) {
       throw wrapDockerError(err);
     }
-
     let lastErrors = '';
     await new Promise<void>((resolve, reject) => {
+      const onAbort = () => {
+        try {
+          // Closing the response stream cancels the client side of the build.
+          const s = stream as unknown as { destroy?: () => void };
+          if (typeof s.destroy === 'function') s.destroy();
+        } catch { /* stream may already be closed */ }
+        reject(new Error('build cancelled'));
+      };
+      if (opts.signal) {
+        if (opts.signal.aborted) return onAbort();
+        opts.signal.addEventListener('abort', onAbort, { once: true });
+      }
       this.docker.modem.followProgress(
         stream,
         (err: Error | null) => {
+          opts.signal?.removeEventListener('abort', onAbort);
           if (err) reject(wrapDockerError(err));
           else if (lastErrors.trim()) {
             reject(new Error(normalizeBuildError(lastErrors)));
           } else resolve();
         },
         (event: { stream?: string; errorDetail?: { message?: string }; error?: string }) => {
-          if (event.stream) opts.onOutput(event.stream);
+          if (event.stream) opts.onOutput?.(event.stream);
           if (event.error || event.errorDetail?.message) {
             lastErrors += (event.error ?? '') + (event.errorDetail?.message ?? '') + '\n';
           }
@@ -454,12 +468,12 @@ export class DockerRuntime {
     }
   }
 
-  /** MiniCloud-managed networks (minicloud-app-*). */
+  /** MiniCloud-managed networks (production minicloud-app-*, previews minicloud-prev-*). */
   async listMiniCloudNetworks(): Promise<{ id: string; name: string }[]> {
     try {
-      const networks = await this.docker.listNetworks({ filters: { name: ['minicloud-app-'] } });
+      const networks = await this.docker.listNetworks({ filters: { name: ['minicloud-app-', 'minicloud-prev-'] } });
       return networks
-        .filter((n) => n.Name.startsWith('minicloud-app-'))
+        .filter((n) => n.Name.startsWith('minicloud-app-') || n.Name.startsWith('minicloud-prev-'))
         .map((n) => ({ id: n.Id, name: n.Name }));
     } catch (err) {
       throw wrapDockerError(err);

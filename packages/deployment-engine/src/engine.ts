@@ -24,6 +24,8 @@ import {
   DeploymentEventRepository,
   DeploymentServiceRepository,
   ApplicationVolumeRepository,
+  BuildArtifactRepository,
+  PreviewRepository,
   type ApplicationRow,
   type DeploymentRow,
   type DeploymentServiceRow,
@@ -40,6 +42,7 @@ import { DockerRuntime, DockerUnavailableError, type ContainerResourceLimits } f
 import { cloneRepository } from './git.js';
 import { allocatePort, canBind } from './ports.js';
 import { waitForHealthy } from './health.js';
+import { fingerprintBuildInputs } from './cache.js';
 
 export interface EngineConfig {
   workspaceDir: string;
@@ -160,6 +163,20 @@ export const SERVICE_EVENTS = {
   volumeAttached: 'volume.attached',
 } as const;
 
+/** Queue lifecycle events (v0.7) — persisted alongside pipeline events. */
+export const QUEUE_EVENTS = {
+  claimed: 'queue.claimed',
+  superseded: 'queue.superseded',
+  cancelled: 'deployment.cancelled',
+  cancelRequested: 'cancellation.requested',
+} as const;
+
+/** Build-cache observability events (v0.7). Metadata carries tags/fingerprints, never secret values. */
+export const CACHE_EVENTS = {
+  cacheMiss: 'build.cache_miss',
+  imageReused: 'build.image_reused',
+} as const;
+
 /** Automatic-restart backoff: attempt N (1-based) waits min(2^N * 2s, 15s). */
 export function autoRestartDelayMs(attempt: number): number {
   return Math.min(2 ** attempt * 2000, 15_000);
@@ -186,7 +203,9 @@ export class DeploymentEngine {
     this.appConfig = new AppConfigRepository(db);
     this.events = new DeploymentEventRepository(db);
     this.services = new DeploymentServiceRepository(db);
+    this.previews = new PreviewRepository(db);
     this.volumes = new ApplicationVolumeRepository(db);
+    this.artifacts = new BuildArtifactRepository(db);
     // A relative WORKSPACE_DIR (the .env default) would otherwise be resolved
     // against git's own cwd inside cloneRepository — normalize once, here.
     this.config = { ...config, workspaceDir: path.resolve(config.workspaceDir) };
@@ -199,6 +218,8 @@ export class DeploymentEngine {
   private readonly events: DeploymentEventRepository;
   private readonly services: DeploymentServiceRepository;
   private readonly volumes: ApplicationVolumeRepository;
+  private readonly artifacts: BuildArtifactRepository;
+  private readonly previews: PreviewRepository;
 
   /**
    * Persist a lifecycle event. Event persistence must never break the
@@ -436,11 +457,23 @@ export class DeploymentEngine {
     // Traffic target when this deployment started building; the cutover is
     // guarded against this value so superseded builds never steal traffic.
     const expectedOld = app.active_deployment_id;
+    // Preview context (v0.7): a preview deployment swaps only its own route.
+    const previewEnvId = current.preview_environment_id;
+    const expectedOldPreview = previewEnvId
+      ? (await this.previews.byId(previewEnvId))?.active_preview_deployment_id ?? null
+      : null;
 
     const deploymentTag = `minicloud/app-${app.id.slice(0, 8)}:d-${deploymentId.slice(0, 12)}`;
     const containerName = `minicloud-d-${deploymentId.slice(0, 12)}`;
 
     const fail = async (stage: string, message: string): Promise<void> => {
+      // Cancellation owns the terminal transition once it has landed: a
+      // pipeline unwinding from an abort must not overwrite CANCELLED (or any
+      // other terminal state an racing operator set) with FAILED.
+      const fresh = await this.deployments.byId(deploymentId);
+      if (!fresh || !['QUEUED', 'CLONING', 'BUILDING', 'STARTING', 'HEALTH_CHECKING'].includes(fresh.status)) {
+        return;
+      }
       await this.transition(deploymentId, null, 'FAILED', {
         failure_reason: `${stage}: ${truncate(message, 1000)}`,
       });
@@ -451,6 +484,7 @@ export class DeploymentEngine {
     // Rollback fast path: reuse the target revision's image when it still
     // exists locally; otherwise the pipeline rebuilds from row.ref (which
     // rollbackDeployment set to the target's commit SHA).
+    let cachedImageTag: string | null = null;
     const rollbackTarget = current.rollback_of_deployment_id
       ? await this.deployments.byId(current.rollback_of_deployment_id)
       : null;
@@ -492,7 +526,8 @@ export class DeploymentEngine {
     // ---- CLONING / BUILDING ------------------------------------------------
     let row = await this.deployments.byId(deploymentId);
     if (!row || !(await transitionOrDie(row, 'CLONING'))) return;
-    row = (await this.deployments.transitionStatus(deploymentId, ['QUEUED'], 'CLONING'))!;
+    row = await this.deployments.transitionStatus(deploymentId, ['QUEUED'], 'CLONING');
+    if (!row) return; // lost a race against cancellation/stop between read and write
 
     let commitSha: string;
     if (reuseImageTag && rollbackTarget) {
@@ -514,8 +549,12 @@ export class DeploymentEngine {
       await this.event(deploymentId, DEPLOYMENT_EVENTS.cloneStarted, row.ref ?? 'HEAD');
       this.logger.info('clone started', { deploymentId, app: app.name });
       try {
-        const cloned = await cloneRepository(app.repository_url, this.config.workspaceDir, row.ref ?? undefined, (m) =>
-          this.emitLog(deploymentId, { source: 'system', stream: 'stdout', message: m }),
+        const cloned = await cloneRepository(
+          app.repository_url,
+          this.config.workspaceDir,
+          row.ref ?? undefined,
+          (m) => this.emitLog(deploymentId, { source: 'system', stream: 'stdout', message: m }),
+          abort.signal,
         );
         repoDir = cloned.dir;
         commitSha = cloned.commitSha;
@@ -564,23 +603,56 @@ export class DeploymentEngine {
         return;
       }
 
-      try {
-        await this.docker.build({
-          contextDir: repoDir!,
-          tag: deploymentTag,
-          onOutput: (chunk) => {
-            for (const line of chunk.split(/\r?\n/)) {
-              if (line.trim()) this.emitLog(deploymentId, { source: 'build', stream: 'stdout', message: line });
-            }
-          },
+      // Build-cache identity (v0.7): commit + Dockerfile + context contents.
+      // An exact previously-built image for this fingerprint is reused instead
+      // of rebuilding; otherwise Docker's layer cache still accelerates the
+      // build and the result is recorded for future reuse.
+      let imageInUse = deploymentTag;
+      const fingerprint = await fingerprintBuildInputs(commitSha, repoDir!, '');
+      const artifact = await this.artifacts.find(app.id, fingerprint, null);
+      if (artifact && (await this.docker.imageExists(artifact.image_tag))) {
+        imageInUse = artifact.image_tag;
+        await this.artifacts.markUsed(artifact.id);
+        await this.deployments.updateFields(deploymentId, { build_cache: 'image_reused' });
+        await this.event(
+          deploymentId,
+          CACHE_EVENTS.imageReused,
+          `exact image reused for commit ${artifact.commit_sha.slice(0, 12) || 'same inputs'}`,
+          { fingerprint: fingerprint.slice(0, 16), imageTag: imageInUse, originalCommit: artifact.commit_sha },
+        );
+        this.logger.info('build skipped: exact image reused', { deploymentId, image: imageInUse });
+      } else {
+        await this.deployments.updateFields(deploymentId, { build_cache: 'miss' });
+        await this.event(deploymentId, CACHE_EVENTS.cacheMiss, 'building from Dockerfile', {
+          fingerprint: fingerprint.slice(0, 16),
         });
-      } catch (err) {
-        await fail('build', err instanceof Error ? err.message : String(err));
-        await repoCleanup(repoDir);
-        return;
+        try {
+          await this.docker.build({
+            contextDir: repoDir!,
+            tag: deploymentTag,
+            signal: abort.signal,
+            onOutput: (chunk) => {
+              for (const line of chunk.split(/\r?\n/)) {
+                if (line.trim()) this.emitLog(deploymentId, { source: 'build', stream: 'stdout', message: line });
+              }
+            },
+          });
+          await this.artifacts.record({
+            applicationId: app.id,
+            commitSha,
+            serviceName: null,
+            fingerprint,
+            imageTag: deploymentTag,
+          });
+        } catch (err) {
+          await fail('build', err instanceof Error ? err.message : String(err));
+          await repoCleanup(repoDir);
+          return;
+        }
       }
-      await this.event(deploymentId, DEPLOYMENT_EVENTS.buildCompleted, deploymentTag, { imageTag: deploymentTag });
-      this.logger.info('build completed', { deploymentId, tag: deploymentTag });
+      await this.event(deploymentId, DEPLOYMENT_EVENTS.buildCompleted, imageInUse, { imageTag: imageInUse });
+      this.logger.info('build completed', { deploymentId, tag: imageInUse });
+      cachedImageTag = imageInUse;
     }
 
     // ---- STARTING ----------------------------------------------------------
@@ -589,7 +661,7 @@ export class DeploymentEngine {
       return;
     }
     await this.deployments.transitionStatus(deploymentId, ['BUILDING'], 'STARTING');
-    await this.event(deploymentId, DEPLOYMENT_EVENTS.containerStarting, reuseImageTag ? `image ${reuseImageTag}` : deploymentTag);
+    await this.event(deploymentId, DEPLOYMENT_EVENTS.containerStarting, cachedImageTag ?? reuseImageTag ?? deploymentTag);
     this.logger.info('starting container', { deploymentId });
 
     const containerPort = row.container_port ?? this.config.defaults.containerPort;
@@ -632,7 +704,7 @@ export class DeploymentEngine {
     let containerId: string;
     try {
       const started = await this.docker.startManagedContainer({
-        image: reuseImageTag ?? deploymentTag,
+        image: reuseImageTag ?? cachedImageTag ?? deploymentTag,
         name: containerName,
         appLabel: app.id,
         deploymentLabel: deploymentId,
@@ -648,8 +720,18 @@ export class DeploymentEngine {
       return;
     }
 
+    // Cancellation between port allocation and container creation lands the
+    // row in CANCELLED; a container created anyway must not survive it.
+    const statusNow = (await this.deployments.byId(deploymentId))?.status;
+    if (statusNow === 'CANCELLED' || statusNow === 'STOPPED') {
+      await this.docker.stop(containerId).catch(() => {});
+      await this.docker.remove(containerId, true).catch(() => {});
+      await repoCleanup(repoDir);
+      return;
+    }
+    const effectiveImage = reuseImageTag ?? cachedImageTag ?? deploymentTag;
     await this.deployments.updateFields(deploymentId, {
-      image_tag: reuseImageTag ?? deploymentTag,
+      image_tag: effectiveImage,
       container_id: containerId,
       container_name: containerName,
       host_port: hostPort,
@@ -660,7 +742,7 @@ export class DeploymentEngine {
     await this.event(deploymentId, DEPLOYMENT_EVENTS.containerStarted, `port ${hostPort}`, {
       containerId: short(containerId),
       hostPort,
-      imageTag: reuseImageTag ?? deploymentTag,
+      imageTag: effectiveImage,
     });
 
     // ---- HEALTH_CHECKING ---------------------------------------------------
@@ -687,6 +769,11 @@ export class DeploymentEngine {
     await repoCleanup(repoDir);
 
     if (!health.ok) {
+      if ((await this.deployments.byId(deploymentId))?.status === 'CANCELLED') {
+        // Cancelled mid-health-check: canceller already cleaned up.
+        await repoCleanup(repoDir);
+        return;
+      }
       // Surface the container's last output for diagnostics, then clean up.
       const logsTail = await this.docker.recentLogs(containerId, 200).catch(() => '');
       if (logsTail) {
@@ -722,7 +809,17 @@ export class DeploymentEngine {
     // Zero-downtime cutover: this deployment is healthy; switch traffic only
     // now. expectedOld was captured when the pipeline started, so a deployment
     // that finished after being superseded retires instead of stealing traffic.
-    await this.activateDeployment(deploymentId, app, expectedOld, hostPort, healthPath);
+    if (previewEnvId) {
+      await this.activatePreview(
+        deploymentId,
+        previewEnvId,
+        expectedOldPreview,
+        current.gateway_route_key ?? app.route_slug!,
+        [{ key: current.gateway_route_key ?? app.route_slug!, service: '', hostPort, healthPath }],
+      );
+    } else {
+      await this.activateDeployment(deploymentId, app, expectedOld, hostPort, healthPath);
+    }
   }
 
   async failWithExitCode(deploymentId: string, reason: string): Promise<void> {
@@ -807,6 +904,63 @@ export class DeploymentEngine {
       return row;
     });
   }
+
+  /**
+   * Cancel an in-flight (non-RUNNING) deployment: QUEUED/CLONING/BUILDING/
+   * STARTING/HEALTH_CHECKING -> CANCELLED, unwinding any pipeline work.
+   *
+   * Deliberately NOT taking the deployment lock: runDeployment holds that lock
+   * for the whole pipeline, so a cancelling caller must not queue behind the
+   * very work it is stopping. Safety comes from the guarded SQL transition
+   * (only one side wins) plus the abort signal; the unwinding pipeline's fail
+   * paths no-op once CANCELLED is on the row.
+   *
+   * RUNNING is refused: cancelling a live deployment would masquerade as
+   * stop/rollback semantics. Callers get a typed error to surface.
+   */
+  async cancelPipeline(deploymentId: string, reason = 'cancelled by user'): Promise<'cancelled' | 'already_terminal'> {
+    const row = await this.deployments.byId(deploymentId);
+    if (!row) throw new EngineError('Deployment not found', 'cancel');
+    if (['FAILED', 'STOPPED', 'CANCELLED'].includes(row.status)) return 'already_terminal';
+    if (row.status === 'RUNNING') {
+      throw new EngineError(
+        'Deployment is RUNNING and cannot be cancelled. Stop it (or roll back) instead.',
+        'cancel',
+      );
+    }
+    await this.event(deploymentId, QUEUE_EVENTS.cancelRequested, truncate(reason, 300));
+    const updated = await this.deployments.transitionStatus(
+      deploymentId,
+      ['QUEUED', 'CLONING', 'BUILDING', 'STARTING', 'HEALTH_CHECKING'],
+      'CANCELLED',
+      { failure_reason: truncate(reason, 1000) },
+      { stoppedAt: new Date() },
+    );
+    if (!updated) return 'already_terminal'; // finished/failed concurrently
+    await this.event(deploymentId, QUEUE_EVENTS.cancelled, truncate(reason, 300));
+
+    // Unwind in-flight work: clone/build abort, health-check loop exit.
+    this.activeRuns.get(deploymentId)?.abort();
+    this.activeRuns.delete(deploymentId);
+
+    // Candidate resources must never outlive a cancellation. The active
+    // production deployment is untouched (we only ever held candidate rows).
+    if (row.container_id) {
+      await this.docker.stop(row.container_id).catch(() => {});
+      await this.docker.remove(row.container_id, true).catch(() => {});
+      await this.deployments.updateFields(deploymentId, { container_id: null, container_name: null });
+    }
+    for (const svc of await this.services.listByDeployment(deploymentId)) {
+      if (svc.container_id) {
+        await this.docker.stop(svc.container_id).catch(() => {});
+        await this.docker.remove(svc.container_id, true).catch(() => {});
+      }
+      await this.services.updateFields(svc.id, { status: 'STOPPED', container_id: null, container_name: null });
+    }
+    this.logger.info('deployment cancelled', { deploymentId, reason: truncate(reason, 120) });
+    return 'cancelled';
+  }
+
 
   /**
    * Restart a RUNNING/FAILED/STOPPED deployment by re-running its container.
@@ -1029,12 +1183,27 @@ export class DeploymentEngine {
   ): Promise<void> {
     const abort = new AbortController();
     this.activeRuns.set(deploymentId, abort);
-    const appNetwork = this.appNetworkName(app.id);
     const deploymentTagBase = `minicloud/app-${app.id.slice(0, 8)}`;
+
+    // Preview context (v0.7): previews deploy into an isolated network with
+    // EPHEMERAL storage and their own route key; they never touch the
+    // application's production volumes, active pointer or routes.
+    const entryRow = await this.deployments.byId(deploymentId);
+    const previewEnvId = entryRow?.preview_environment_id ?? null;
+    const isPreview = previewEnvId !== null;
+    const appNetwork = isPreview && previewEnvId
+      ? `minicloud-prev-${previewEnvId.slice(0, 8)}`
+      : this.appNetworkName(app.id);
+    const routeKey = entryRow?.gateway_route_key ?? app.route_slug;
+    // Preview traffic target when this deployment started building; the
+    // preview cutover is guarded against this value.
+    const expectedOldPreview = previewEnvId
+      ? (await this.previews.byId(previewEnvId))?.active_preview_deployment_id ?? null
+      : null;
 
     // Rollback fast path enters in QUEUED (no clone/build happened): walk the
     // state machine to BUILDING so the STARTING transition is legal.
-    const entryStatus = (await this.deployments.byId(deploymentId))?.status;
+    const entryStatus = entryRow?.status;
     if (entryStatus === 'QUEUED') {
       for (const [from, to] of [['QUEUED', 'CLONING'], ['CLONING', 'BUILDING']] as const) {
         if (!(await this.deployments.transitionStatus(deploymentId, [from], to))) return;
@@ -1042,6 +1211,11 @@ export class DeploymentEngine {
     }
 
     const fail = async (stage: string, message: string): Promise<void> => {
+      // Cancellation-safe: never overwrite a terminal state set concurrently.
+      const freshRow = await this.deployments.byId(deploymentId);
+      if (!freshRow || !['QUEUED', 'CLONING', 'BUILDING', 'STARTING', 'HEALTH_CHECKING'].includes(freshRow.status)) {
+        return;
+      }
       await this.transition(deploymentId, null, 'FAILED', {
         failure_reason: `${stage}: ${truncate(message, 1000)}`,
       });
@@ -1065,24 +1239,28 @@ export class DeploymentEngine {
         });
       }
 
-      // Network + volumes (idempotent; volumes persist across deployments).
+      // Network + volumes. Production: named volumes persist across
+      // deployments. PREVIEWS: volumes are never created or mounted — PR code
+      // must not read production data (v0.7 security policy).
       await this.docker.ensureNetwork(appNetwork);
       await this.event(deploymentId, SERVICE_EVENTS.networkCreated, appNetwork, { network: appNetwork });
       const volumeMountsByService: Record<string, Array<{ volume: string; target: string }>> = {};
-      for (const volName of Object.keys(manifest.volumes)) {
-        const dockerVolume = this.appVolumeName(app.id, volName);
-        await this.docker.ensureVolume(dockerVolume);
-        await this.volumes.ensure(app.id, volName, dockerVolume);
-        await this.event(deploymentId, SERVICE_EVENTS.volumeAttached, `${volName} → ${dockerVolume}`, {
-          volume: volName,
-          dockerVolume,
-        });
-      }
-      for (const svc of manifest.services) {
-        volumeMountsByService[svc.name] = svc.volumes.map((mount) => {
-          const [volName, target] = mount.split(':') as [string, string];
-          return { volume: this.appVolumeName(app.id, volName), target };
-        });
+      if (!isPreview) {
+        for (const volName of Object.keys(manifest.volumes)) {
+          const dockerVolume = this.appVolumeName(app.id, volName);
+          await this.docker.ensureVolume(dockerVolume);
+          await this.volumes.ensure(app.id, volName, dockerVolume);
+          await this.event(deploymentId, SERVICE_EVENTS.volumeAttached, `${volName} → ${dockerVolume}`, {
+            volume: volName,
+            dockerVolume,
+          });
+        }
+        for (const svc of manifest.services) {
+          volumeMountsByService[svc.name] = svc.volumes.map((mount) => {
+            const [volName, target] = mount.split(':') as [string, string];
+            return { volume: this.appVolumeName(app.id, volName), target };
+          });
+        }
       }
 
       // Rollback image reuse: per-service images from the target deployment.
@@ -1101,7 +1279,9 @@ export class DeploymentEngine {
       }
       const needBuild = !reusedImages;
 
-      // Build every service image.
+      // Build every service image, with exact-image reuse per service.
+      let reusedCount = 0;
+      let builtCount = 0;
       if (needBuild && repoDir) {
         for (const svc of manifest.startOrder) {
           const svcDef = manifest.services.find((sd) => sd.name === svc)!;
@@ -1113,6 +1293,33 @@ export class DeploymentEngine {
             return;
           }
           const tag = `${deploymentTagBase}:${svc}-d-${deploymentId.slice(0, 12)}`;
+          const svcRowForBuild = (await this.services.byName(deploymentId, svc))!;
+          // Per-service cache identity: same rules as single-service builds.
+          let image = tag;
+          if (!reusedImages?.[svc]) {
+            const fp = await fingerprintBuildInputs(commitSha, path.resolve(repoDir, svcDef.context), dockerfileInContext);
+            const artifact = await this.artifacts.find(app.id, fp, svc);
+            if (artifact && (await this.docker.imageExists(artifact.image_tag))) {
+              image = artifact.image_tag;
+              await this.artifacts.markUsed(artifact.id);
+              reusedCount++;
+              await this.event(
+                deploymentId,
+                CACHE_EVENTS.imageReused,
+                `${svc}: exact image reused`,
+                { serviceName: svc, imageTag: image, fingerprint: fp.slice(0, 16), originalCommit: artifact.commit_sha },
+              );
+              await this.services.updateFields(svcRowForBuild.id, { image_tag: image });
+              await this.event(deploymentId, SERVICE_EVENTS.buildCompleted, `${svc} (reused)`, { serviceName: svc, imageTag: image });
+              continue;
+            }
+            await this.event(deploymentId, CACHE_EVENTS.cacheMiss, `${svc}: building from Dockerfile`, {
+              serviceName: svc,
+              fingerprint: fp.slice(0, 16),
+            });
+          } else {
+            image = reusedImages[svc];
+          }
           await this.event(deploymentId, SERVICE_EVENTS.buildStarted, `${svc}: ${tag}`, {
             serviceName: svc,
             imageTag: tag,
@@ -1122,11 +1329,20 @@ export class DeploymentEngine {
               contextDir: path.resolve(repoDir, svcDef.context),
               tag,
               dockerfile: dockerfileInContext,
+              signal: abort.signal,
               onOutput: (chunk) => {
                 for (const line of chunk.split(/\r?\n/)) {
                   if (line.trim()) this.emitLog(deploymentId, { source: 'build', stream: 'stdout', message: line });
                 }
               },
+            });
+            builtCount++;
+            await this.artifacts.record({
+              applicationId: app.id,
+              commitSha,
+              serviceName: svc,
+              fingerprint: await fingerprintBuildInputs(commitSha, path.resolve(repoDir, svcDef.context), dockerfileInContext),
+              imageTag: tag,
             });
             await this.event(deploymentId, SERVICE_EVENTS.buildCompleted, svc, { serviceName: svc, imageTag: tag });
           } catch (err) {
@@ -1141,6 +1357,11 @@ export class DeploymentEngine {
             return;
           }
         }
+      }
+      if (needBuild && repoDir) {
+        await this.deployments.updateFields(deploymentId, {
+          build_cache: reusedCount === 0 ? 'miss' : builtCount === 0 ? 'image_reused' : 'partial',
+        });
       }
 
       // Effective app configuration (env/secrets/limits) once for all services.
@@ -1169,7 +1390,9 @@ export class DeploymentEngine {
         const svcDef = manifest.services.find((s) => s.name === svcName)!;
         const svcRow = (await this.services.byName(deploymentId, svcName))!;
         const image =
-          reusedImages?.[svcName] ?? `${deploymentTagBase}:${svcName}-d-${deploymentId.slice(0, 12)}`;
+          reusedImages?.[svcName] ??
+          (await this.services.byName(deploymentId, svcName))!.image_tag ??
+          `${deploymentTagBase}:${svcName}-d-${deploymentId.slice(0, 12)}`;
 
         const env: Record<string, string> = { ...cfg.env, ...(svcDef.env ?? {}) };
         // Service registry env: services resolve each other by name.
@@ -1254,7 +1477,7 @@ export class DeploymentEngine {
             return;
           }
           await this.event(deploymentId, SERVICE_EVENTS.healthPassed, svcName, { serviceName: svcName });
-          publicRoutes.push({ key: publicRoutes.length === 0 ? app.route_slug! : `${svcName}.${app.route_slug}`, service: svcName, hostPort, healthPath });
+          publicRoutes.push({ key: publicRoutes.length === 0 ? routeKey! : `${svcName}.${routeKey}`, service: svcName, hostPort, healthPath });
           if (publicRoutes.length === 1) {
             firstPublicPort = hostPort;
             firstPublicHealth = healthPath;
@@ -1293,9 +1516,13 @@ export class DeploymentEngine {
       });
       this.logger.info('multi-service deployment running', { deploymentId, app: app.name });
 
-      // Cutover: same guarded swap as single-service, but routes cover every
-      // public service of the manifest.
-      await this.activateMulti(deploymentId, app, expectedOld, publicRoutes, firstPublicPort, firstPublicHealth);
+      // Cutover: previews swap the PREVIEW pointer + route only — production
+      // routing is never consulted or modified.
+      if (isPreview && previewEnvId) {
+        await this.activatePreview(deploymentId, previewEnvId, expectedOldPreview, routeKey!, publicRoutes);
+      } else {
+        await this.activateMulti(deploymentId, app, expectedOld, publicRoutes, firstPublicPort, firstPublicHealth);
+      }
     } catch (err) {
       // Anything unexpected: fail loudly, previous version keeps serving.
       await fail('pipeline', err instanceof Error ? err.message : String(err));
@@ -1316,6 +1543,103 @@ export class DeploymentEngine {
       }
     }
   }
+
+  /**
+   * Preview cutover: swap the PREVIEW environment's active pointer (guarded),
+   * register/verify the preview routes, then retire the previous preview
+   * deployment. Production routing state is never touched.
+   */
+  private async activatePreview(
+    deploymentId: string,
+    envId: string,
+    expectedOldDep: string | null,
+    routeKey: string,
+    publicRoutes: Array<{ key: string; service: string; hostPort: number; healthPath: string }>,
+  ): Promise<void> {
+    const gw = this.gateway;
+    if (!gw) return;
+    // Lock key is scoped to THIS preview environment: concurrent previews of
+    // one application never serialize against production deploys.
+    await this.withAppLock(`preview:${envId}`, async () => {
+      const env = await this.previews.byId(envId);
+      if (!env || env.status === 'closed') {
+        await this.retireAny(deploymentId, 'preview closed before cutover');
+        return;
+      }
+      const current = env.active_preview_deployment_id;
+      if (current === deploymentId) return;
+      await this.event(deploymentId, TRAFFIC_EVENTS.cutoverStarted, `preview ${env.pr_number}: ${short(current ?? 'none')} → ${short(deploymentId)}`, {
+        previewEnvironmentId: envId,
+        prNumber: env.pr_number,
+        from: current,
+        to: deploymentId,
+      });
+      const swapped = await this.previews.setActiveDeployment(envId, deploymentId, expectedOldDep);
+      if (!swapped) {
+        await this.event(deploymentId, TRAFFIC_EVENTS.superseded, 'preview traffic switched elsewhere during cutover');
+        await this.retireAny(deploymentId, 'superseded during preview cutover');
+        return;
+      }
+      for (const r of publicRoutes) {
+        gw.setRoute(r.key, { deploymentId, host: '127.0.0.1', port: r.hostPort });
+      }
+
+      let allVerified = true;
+      for (const r of publicRoutes) {
+        if (!(await gw.verifyRoute(r.key, r.healthPath))) {
+          allVerified = false;
+          break;
+        }
+      }
+      if (!allVerified) {
+        await this.event(deploymentId, TRAFFIC_EVENTS.cutoverFailed, 'gateway verification failed; reverting preview traffic', {
+          previewEnvironmentId: envId,
+        });
+        if (current) {
+          await this.previews.setActiveDeployment(envId, current, deploymentId);
+          const oldRow = await this.deployments.byId(current);
+          if (oldRow?.manifest_snapshot) {
+            for (const os of await this.services.listByDeployment(current)) {
+              if (os.public_service && os.host_port) {
+                const key = os.service_name === publicRoutes[0]?.service ? routeKey : `${os.service_name}.${routeKey}`;
+                gw.setRoute(key, { deploymentId: current, host: '127.0.0.1', port: os.host_port });
+              }
+            }
+          } else if (oldRow?.host_port) {
+            gw.setRoute(routeKey, { deploymentId: current, host: '127.0.0.1', port: oldRow.host_port });
+          }
+        } else {
+          for (const r of publicRoutes) gw.setRoute(r.key, null);
+          await this.previews.clearActiveDeployment(envId, deploymentId);
+        }
+        await this.retireAny(deploymentId, 'preview cutover verification failed; previous preview kept serving');
+        return;
+      }
+
+      await this.event(deploymentId, TRAFFIC_EVENTS.cutoverCompleted, `${routeKey} now serves ${short(deploymentId)}`, {
+        previewEnvironmentId: envId,
+        prNumber: env.pr_number,
+        routeKey,
+      });
+      this.logger.info('preview cutover complete', { deploymentId, envId, routeKey });
+      if (current) {
+        // Drain in-flight requests on the replaced preview, then stop it.
+        await this.drainAndRetireMulti(current, publicRoutes[0]?.key ?? routeKey);
+      }
+    });
+  }
+
+  /** Retire whichever shape a deployment is: multi-service or single-service. */
+  private async retireAny(deploymentId: string, reason: string): Promise<void> {
+    const row = await this.deployments.byId(deploymentId);
+    if (!row) return;
+    if (row.manifest_snapshot) {
+      await this.retireMulti(deploymentId, reason);
+    } else {
+      await this.retireDeployment(deploymentId, reason);
+    }
+  }
+
 
   /**
    * Multi-service cutover: guarded swap + gateway routes for every public
@@ -1554,7 +1878,7 @@ export class DeploymentEngine {
       const row = rows.find((r) => r.service_name === sd.name);
       if (!row?.host_port) continue;
       keys.push({
-        key: first ? app.route_slug! : `${sd.name}.${app.route_slug}`,
+        key: first ? (dep.gateway_route_key ?? app.route_slug!) : `${sd.name}.${dep.gateway_route_key ?? app.route_slug}`,
         service: sd.name,
         hostPort: row.host_port,
         healthPath: sd.health?.path ?? this.config.defaults.healthPath,
@@ -1562,6 +1886,12 @@ export class DeploymentEngine {
       first = false;
     }
     return keys;
+  }
+
+  /** First public service name from a deployment's manifest snapshot. */
+  private firstServiceOf(dep: DeploymentRow): string | null {
+    const snap = dep.manifest_snapshot as unknown as { services: Array<{ name: string; public: boolean }> } | null;
+    return snap?.services.find((s) => s.public)?.name ?? null;
   }
 
   /**
@@ -1839,10 +2169,28 @@ export class DeploymentEngine {
       reuseImage: reusable,
     });
     this.logger.info('rollback queued', { deploymentId: dep.id, target: target.id, reuseImage: reusable });
-    void this.runDeployment(dep.id).catch((err) => {
-      this.logger.error('rollback pipeline crashed unexpectedly', { deploymentId: dep.id, error: String(err) });
-    });
+    // Since v0.7 the deployment queue owns execution; callers enqueue it.
     return dep;
+  }
+
+  /**
+   * Tear down one preview deployment (PR closed / explicit delete): drop its
+   * route, retire its containers/network. Persistent production volumes are
+   * never touched — previews have no volume mounts by policy. The row stays
+   * as STOPPED history inside the preview environment.
+   */
+  async teardownPreviewDeployment(deploymentId: string): Promise<void> {
+    const row = await this.deployments.byId(deploymentId);
+    if (!row || !row.preview_environment_id) return;
+    if (this.gateway && row.gateway_route_key) {
+      this.gateway.setRoute(row.gateway_route_key, null);
+    }
+    await this.retireAny(deploymentId, 'preview environment closed');
+    // Multi-service previews get their own network; remove it once empty.
+    if (row.manifest_snapshot) {
+      await this.docker.removeNetwork(`minicloud-prev-${row.preview_environment_id.slice(0, 8)}`).catch(() => {});
+    }
+    this.logger.info('preview deployment torn down', { deploymentId });
   }
 
   // ---- retention ---------------------------------------------------------------
@@ -1868,11 +2216,13 @@ export class DeploymentEngine {
     }
 
     let imagesRemoved = 0;
-    const referenced = new Set(
-      (await this.db.query<{ image_tag: string }>('SELECT image_tag FROM deployments WHERE image_tag IS NOT NULL')).rows.map(
+    const referenced = new Set([
+      ...(await this.db.query<{ image_tag: string }>('SELECT image_tag FROM deployments WHERE image_tag IS NOT NULL')).rows.map(
         (r) => r.image_tag,
       ),
-    );
+      // Build-cache artifacts are rollback/reuse targets: keep their images.
+      ...(await this.artifacts.allTags()),
+    ]);
     for (const img of await this.docker.listMiniCloudImages()) {
       for (const tag of img.tags) {
         if (!referenced.has(tag)) {
@@ -1938,9 +2288,19 @@ export class DeploymentEngine {
     }
 
     const rows = await this.db.query<DeploymentRow>(
-      "SELECT * FROM deployments WHERE status NOT IN ('FAILED','STOPPED') OR container_id IS NOT NULL",
+      "SELECT * FROM deployments WHERE status NOT IN ('FAILED','STOPPED','CANCELLED') OR container_id IS NOT NULL",
+    );
+    // QUEUED rows with a live queue job are waiting for a scheduler slot —
+    // they are healthy state, not crashes to fail.
+    const waitingQueued = new Set(
+      (
+        await this.db.query<{ deployment_id: string }>(
+          "SELECT deployment_id FROM deployment_jobs WHERE status = 'queued'",
+        )
+      ).rows.map((r) => r.deployment_id),
     );
     for (const row of rows.rows) {
+      if (row.status === 'QUEUED' && waitingQueued.has(row.id)) continue;
       const container = row.container_id
         ? containers.find((c) => c.id === row.container_id) ??
           byDeploymentLabel.get(row.id)
@@ -2066,6 +2426,39 @@ export class DeploymentEngine {
               if (upstream) this.gateway.setRoute(key.key, upstream);
             }
           }
+        }
+      }
+    }
+
+    // Preview environments: rebuild routes from the persisted active preview
+    // deployment and ensure their isolated networks still exist.
+    if (this.gateway) {
+      for (const env of await this.previews.listOpen()) {
+        const appRow = await this.apps.byId(env.application_id);
+        if (!appRow) continue;
+        const dep = env.active_preview_deployment_id
+          ? await this.deployments.byId(env.active_preview_deployment_id)
+          : null;
+        const up =
+          dep?.status === 'RUNNING' &&
+          (dep.container_id || dep.manifest_snapshot) &&
+          (dep.container_id
+            ? (await this.docker.getContainerState(dep.container_id).catch(() => null))?.running === true
+            : true);
+        if (!up) {
+          this.gateway.setRoute(env.route_slug, null);
+          continue;
+        }
+        if (dep!.manifest_snapshot) {
+          await this.docker.ensureNetwork(`minicloud-prev-${env.id.slice(0, 8)}`);
+          for (const svc of await this.services.listByDeployment(dep!.id)) {
+            if (svc.public_service && svc.host_port && svc.status === 'RUNNING') {
+              const key = svc.service_name === this.firstServiceOf(dep!) ? env.route_slug : `${svc.service_name}.${env.route_slug}`;
+              this.gateway.setRoute(key, { deploymentId: dep!.id, host: '127.0.0.1', port: svc.host_port });
+            }
+          }
+        } else if (dep!.host_port) {
+          this.gateway.setRoute(env.route_slug, { deploymentId: dep!.id, host: '127.0.0.1', port: dep!.host_port });
         }
       }
     }

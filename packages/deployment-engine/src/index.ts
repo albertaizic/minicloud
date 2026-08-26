@@ -3,3 +3,5 @@ export * from './git.js';
 export * from './git-remote.js';
 export * from './ports.js';
 export * from './health.js';
+export * from './queue.js';
+export * from './cache.js';

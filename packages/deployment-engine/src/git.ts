@@ -43,6 +43,7 @@ export async function cloneRepository(
   workspaceDir: string,
   ref?: string,
   onOutput?: (msg: string) => void,
+  signal?: AbortSignal,
 ): Promise<ClonedRepo> {
   if (!isValidGitUrl(repoUrl)) {
     throw new CloneError(`Unsupported repository URL: ${repoUrl.slice(0, 100)}`);
@@ -65,6 +66,8 @@ export async function cloneRepository(
         timeout: 120_000,
         maxBuffer: 10 * 1024 * 1024,
         windowsHide: true,
+        // Aborting SIGTERMs the git child process — no zombie clones.
+        ...(signal ? { signal } : {}),
       });
     // A full 40-hex ref is a commit SHA, not a branch: clone without checkout
     // (full history so ancestor commits are present), then detached-checkout.
