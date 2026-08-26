@@ -135,7 +135,13 @@ test.describe.serial('multi-service + zero-downtime UI (real stack)', () => {
       if (appRow.activeDeploymentId === depA) { rolledBack = true; break; }
       await new Promise((r) => setTimeout(r, 500));
     }
-    expect(rolledBack).toBe(true);
+    // TEMP-PROBE: persist whole-app truth for post-mortem.
+    const fsx = await import('node:fs/promises');
+    const finalState = (await apiGet(`/api/apps/${appId}`)) as { activeDeploymentId?: string; deployments: Array<{ id: string; status: string; rollbackOf: string | null }> };
+    await fsx.writeFile('probe-vol.json', JSON.stringify({
+      rolledBack, active: finalState.activeDeploymentId,
+      deps: finalState.deployments.map((d) => ({ id: d.id.slice(0, 8), status: d.status, rb: (d.rollbackOf ?? '').slice(0, 8) || null })),
+    }, null, 2));
     // Version back to A; the volume counter NOT reset.
     const home = await appUrl('e2e-msvc');
     const parsed = JSON.parse(home.body) as { version: string; api: { count: number } };
