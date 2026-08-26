@@ -84,7 +84,7 @@ test.describe.serial('queue & preview UI (v0.7)', () => {
     const { consoleErrors, pageErrors } = attachErrorCollectors(page);
     // Enqueue TWO deploys back-to-back without a running scheduler tick gap:
     // the second must be visibly QUEUED behind the first.
-    const dres = await fetch(`${API}/api/apps/${appId}/deploy`, { method: 'POST', body: '{}' });
+    const dres = await fetch(`${API}/api/apps/${appId}/deploy`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' });
     const first = (await dres.json()) as { deployment: { id: string }; jobId: string };
     expect(first.jobId).toBeTruthy();
 
@@ -95,7 +95,7 @@ test.describe.serial('queue & preview UI (v0.7)', () => {
     expectNoErrors(consoleErrors, pageErrors);
 
     // Cancel path from the UI on a SECOND deployment that queues behind:
-    const d2 = await fetch(`${API}/api/apps/${appId}/deploy`, { method: 'POST', body: JSON.stringify({}) });
+    const d2 = await fetch(`${API}/api/apps/${appId}/deploy`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' });
     const second = (await d2.json()) as { deployment: { id: string; status: string } };
     if (second.deployment.status === 'QUEUED') {
       const cancelRes = await fetch(`${API}/api/deployments/${second.deployment.id}/cancel`, { method: 'POST' });
@@ -109,7 +109,7 @@ test.describe.serial('queue & preview UI (v0.7)', () => {
 
   test('build progress is observable through RUNNING transition', async ({ page }) => {
     test.setTimeout(420_000);
-    const dres = await fetch(`${API}/api/apps/${appId}/deploy`, { method: 'POST', body: '{}' });
+    const dres = await fetch(`${API}/api/apps/${appId}/deploy`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' });
     const body = (await dres.json()) as { deployment: { id: string } };
     await page.goto(`/deployments/${body.deployment.id}`);
     await expect(page.getByRole('heading', { name: /deployment/i })).toBeVisible();

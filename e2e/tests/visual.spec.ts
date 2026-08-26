@@ -30,6 +30,7 @@ async function expectNoHorizontalOverflow(page: Page, context: string): Promise<
 }
 
 let appId: string;
+let failAppId: string;
 let activeDep: string;
 let failedDep: string;
 
@@ -44,8 +45,15 @@ test.describe.serial('visual / UX audit', () => {
     activeDep = await deployViaApi('e2e-visual', `${FIX}/hello-node.git`);
     await waitForDeploymentStatus(activeDep, ['RUNNING']);
 
-    // A FAILED deployment for the error-state screenshots.
-    failedDep = await deployViaApi('e2e-visual', `${FIX}/failing-app.git`);
+    // A FAILED deployment for the error-state screenshots lives in its OWN
+    // application: one app maps to exactly one repository.
+    const fres = await fetch('http://localhost:4100/api/apps', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ name: 'e2e-visual-fail', repositoryUrl: `${FIX}/failing-app.git` }),
+    });
+    failAppId = (await fres.json()).id;
+    failedDep = await deployViaApi('e2e-visual-fail', `${FIX}/failing-app.git`);
     await waitForDeploymentStatus(failedDep, ['FAILED'], 300_000);
   });
 
@@ -117,5 +125,6 @@ test.describe.serial('visual / UX audit', () => {
 
   test.afterAll(async () => {
     await apiDelete(`/api/apps/${appId}`).catch(() => {});
+    await apiDelete(`/api/apps/${failAppId}`).catch(() => {});
   });
 });

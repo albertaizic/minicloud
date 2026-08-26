@@ -14,8 +14,8 @@ test.describe('error-state UX (real stack)', () => {
     await page.getByPlaceholder('app-name').fill(appName);
     await page.getByPlaceholder('https://github.com/user/repo.git').fill('http://localhost:4555/does-not-exist.git');
     await page.getByRole('button', { name: /create app/i }).click();
-    await expect(page.getByRole('link', { name: appName })).toBeVisible({ timeout: 15_000 });
-    await page.getByRole('link', { name: appName }).click();
+    await expect(page.getByRole('link', { name: appName, exact: true })).toBeVisible({ timeout: 15_000 });
+    await page.getByRole('link', { name: appName, exact: true }).click();
     await page.getByRole('button', { name: /deploy again/i }).click();
 
     const depLink = page.locator('tbody a').first();

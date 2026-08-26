@@ -41,6 +41,9 @@ test.describe.serial('reliability UI flows (real stack)', () => {
 
     await page.goto(`/deployments/${depId}`);
     await expect(page.getByText('RUNNING').first()).toBeVisible();
+    // The force-stop confirmation only appears for the ACTIVE deployment;
+    // cutover lands shortly after RUNNING, so wait for the badge.
+    await expect(page.getByText('ACTIVE').first()).toBeVisible({ timeout: 60_000 });
 
     // Stop the ACTIVE deployment: the UI must surface the force confirmation.
     await page.getByRole('button', { name: /stop/i }).click();

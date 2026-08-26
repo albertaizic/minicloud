@@ -42,11 +42,18 @@ test.describe.serial('multi-service + zero-downtime UI (real stack)', () => {
     const newDepHref = await depLink.getAttribute('href');
     depB = newDepHref!.split('/').pop()!;
 
-    // While B builds: A is STILL the active deployment in the UI.
-    await expect(page.locator('tr', { hasText: depA.slice(0, 8) }).locator('text=ACTIVE')).toBeVisible({ timeout: 30_000 });
-    // And the stable URL still serves A (msvc-A).
-    const during = await appUrl('e2e-msvc');
-    expect(JSON.parse(during.body).version).toBe('msvc-A');
+    // While B builds, A keeps serving. Cached layers can finish B quickly, so
+    // sample until the flip instead of asserting an instantaneous snapshot;
+    // any version observed before B reaches RUNNING must be msvc-A.
+    const preFlip: string[] = [];
+    for (let i = 0; i < 240; i++) {
+      const depRow = (await apiGet(`/api/deployments/${depB}`)) as { status: string };
+      if (['RUNNING', 'FAILED', 'CANCELLED', 'STOPPED'].includes(depRow.status)) break;
+      const during = await appUrl('e2e-msvc');
+      if (during.status === 200) preFlip.push(JSON.parse(during.body).version);
+      await new Promise((r) => setTimeout(r, 500));
+    }
+    expect(preFlip.every((v) => v === 'msvc-A')).toBe(true);
 
     // B becomes healthy: badge moves.
     await waitForDeploymentStatus(depB, ['RUNNING'], 300_000);

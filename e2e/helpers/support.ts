@@ -49,9 +49,17 @@ export async function waitForDeploymentStatus(
 /** Find-or-create an application by name: fixture isolation that tolerates
  *  leftover state from a previous run without masking real API failures. */
 export async function ensureApp(name: string, repoUrl: string): Promise<string> {
-  const apps = (await apiGet('/api/apps')) as Array<{ id: string; name: string }>;
+  const apps = (await apiGet('/api/apps')) as Array<{ id: string; name: string; repositoryUrl?: string }>;
   const existing = apps.find((a) => a.name === name);
-  if (existing) return existing.id;
+  if (existing) {
+    // A name collision with a DIFFERENT repository would silently deploy the
+    // wrong fixture; recreate instead.
+    if ((existing.repositoryUrl ?? '') !== repoUrl) {
+      await apiDelete(`/api/apps/${existing.id}`);
+    } else {
+      return existing.id;
+    }
+  }
   const res = await fetch(`${API}/api/apps`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
