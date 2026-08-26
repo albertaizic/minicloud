@@ -139,9 +139,25 @@ test.describe.serial('multi-service + zero-downtime UI (real stack)', () => {
       await new Promise((r) => setTimeout(r, 500));
     }
     expect(rolledBack).toBe(true);
-    // Version back to A; the volume counter NOT reset.
-    const home = await appUrl('e2e-msvc');
-    const parsed = JSON.parse(home.body) as { version: string; api: { count: number } };
-    expect(parsed.version).toBe('msvc-A');
+    // Version back to A; the volume counter NOT reset. During the predecessor
+    // drain the stable URL may answer from either revision for a moment —
+    // poll until it settles on A.
+    let version = '';
+    for (let i = 0; i < 60; i++) {
+      const home = await appUrl('e2e-msvc');
+      if (home.status === 200) {
+        version = JSON.parse(home.body).version;
+        if (version === 'msvc-A') break;
+      }
+      await new Promise((r) => setTimeout(r, 500));
+    }
+    expect(version).toBe('msvc-A');
+
+    // The volume counter survived the rollback (api still reports its
+    // pre-rollback count through the stable URL).
+    const volHome = await appUrl('e2e-msvc');
+    const parsedVol = JSON.parse(volHome.body) as { version: string; api: { count: number } };
+    expect(parsedVol.version).toBe('msvc-A');
+    expect(parsedVol.api.count).toBeGreaterThanOrEqual(1);
   });
 });
