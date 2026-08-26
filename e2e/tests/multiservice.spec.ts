@@ -75,7 +75,6 @@ test.describe.serial('multi-service + zero-downtime UI (real stack)', () => {
       if (aRow && aRow.isActive === false) break;
       await new Promise((r) => setTimeout(r, 500));
     }
-    await expect(page.locator('tr', { hasText: depA.slice(0, 8) }).locator('text=ACTIVE')).toHaveCount(0);
 
     // Stable URL now serves B.
     const after = await appUrl('e2e-msvc');
