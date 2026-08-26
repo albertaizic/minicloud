@@ -7,7 +7,8 @@ export type DeploymentStatus =
   | 'HEALTH_CHECKING'
   | 'RUNNING'
   | 'FAILED'
-  | 'STOPPED';
+  | 'STOPPED'
+  | 'CANCELLED';
 
 /**
  * Explicit state machine for deployment transitions.
@@ -17,18 +18,20 @@ export type DeploymentStatus =
  * Terminal-ish states:
  *   FAILED (from any non-terminal state, or RUNNING via unexpected exit)
  *   STOPPED (from RUNNING or STARTING+ by explicit user stop)
+ *   CANCELLED (from any non-RUNNING in-flight state by explicit user cancel;
+ *     a RUNNING deployment cannot be "cancelled" — stopping it is a different,
+ *     destructive act and is rejected by the cancel endpoint)
  */
 export const ALLOWED_TRANSITIONS: Record<DeploymentStatus, DeploymentStatus[]> = {
-  QUEUED: ['CLONING', 'FAILED', 'CANCELLED' as DeploymentStatus].filter(
-    (s) => s !== 'CANCELLED',
-  ) as DeploymentStatus[],
-  CLONING: ['BUILDING', 'FAILED'],
-  BUILDING: ['STARTING', 'FAILED'],
-  STARTING: ['HEALTH_CHECKING', 'FAILED', 'STOPPED'],
-  HEALTH_CHECKING: ['RUNNING', 'FAILED', 'STOPPED'],
+  QUEUED: ['CLONING', 'FAILED', 'CANCELLED'],
+  CLONING: ['BUILDING', 'FAILED', 'CANCELLED'],
+  BUILDING: ['STARTING', 'FAILED', 'CANCELLED'],
+  STARTING: ['HEALTH_CHECKING', 'FAILED', 'STOPPED', 'CANCELLED'],
+  HEALTH_CHECKING: ['RUNNING', 'FAILED', 'STOPPED', 'CANCELLED'],
   RUNNING: ['FAILED', 'STOPPED'],
   FAILED: [],
   STOPPED: [],
+  CANCELLED: [],
 };
 
 export class InvalidTransitionError extends Error {
@@ -53,6 +56,17 @@ export function assertTransition(from: DeploymentStatus, to: DeploymentStatus): 
 
 /** Statuses that indicate the deployment is in flight (owned by the engine). */
 export function isActive(status: DeploymentStatus): boolean {
+  return (
+    status === 'QUEUED' ||
+    status === 'CLONING' ||
+    status === 'BUILDING' ||
+    status === 'STARTING' ||
+    status === 'HEALTH_CHECKING'
+  );
+}
+
+/** Statuses a deployment can be cancelled from (never RUNNING — see above). */
+export function isCancellable(status: DeploymentStatus): boolean {
   return (
     status === 'QUEUED' ||
     status === 'CLONING' ||
