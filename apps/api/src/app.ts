@@ -214,7 +214,7 @@ export async function buildApp(opts: BuildAppOptions): Promise<FastifyInstance> 
   // lives in the API because the master key must never leave this process;
   // decrypted values flow straight into the container create call and are
   // neither logged nor persisted.
-  engine.setAppConfigResolver(async (applicationId) => {
+  engine.setAppConfigResolver(async (applicationId, resolverOpts = {}) => {
     const decrypt = (stored: string, key: Buffer | null): string => {
       if (!key) {
         throw new MasterKeyError(
@@ -225,9 +225,28 @@ export async function buildApp(opts: BuildAppOptions): Promise<FastifyInstance> 
     };
     const { env, secretKeys } = await appConfig.resolveRuntimeEnv(applicationId, masterKey, decrypt);
     const limits = await appConfig.getLimits(applicationId);
+
+    // Preview secret policy (v0.7): PR code is untrusted. Encrypted secrets
+    // reach preview containers ONLY when the application explicitly opts in
+    // via secrets_in_previews; plain variables always flow.
+    const isPreview = Boolean(resolverOpts.previewEnvironmentId);
+    let effectiveEnv = env;
+    let effectiveSecretKeys = secretKeys;
+    if (isPreview) {
+      const appRow = await apps.byId(applicationId);
+      const allowed = appRow?.secrets_in_previews === true;
+      if (!allowed) {
+        const secretSet = new Set(secretKeys);
+        effectiveEnv = Object.fromEntries(
+          Object.entries(env).filter(([k]) => !secretSet.has(k)),
+        );
+        effectiveSecretKeys = [];
+      }
+    }
+
     return {
-      env,
-      secretKeys,
+      env: effectiveEnv,
+      secretKeys: effectiveSecretKeys,
       limits:
         limits.memoryLimitMb != null || limits.cpuLimit != null
           ? {

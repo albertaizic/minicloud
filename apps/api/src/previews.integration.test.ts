@@ -182,7 +182,7 @@ describe('preview environments via GitHub webhooks (real docker)', () => {
 
     const served = await requestThroughGateway(ctx.gatewayPort!, `pr-42-${appSlug}.localhost`, '/version');
     expect(served.status).toBe(200);
-    expect(served.body.trim()).toBe('rev-a');
+    expect(served.body.trim()).toBe('revision-a');
 
     // Production routing is a separate concept: nothing was ever deployed there.
     const prod = await requestThroughGateway(ctx.gatewayPort!, `${appSlug}.localhost`);
@@ -197,7 +197,7 @@ describe('preview environments via GitHub webhooks (real docker)', () => {
     const envBefore = list1.find((p) => p.prNumber === 42)!;
     const oldDepId = envBefore.activeDeploymentId as string;
     const servedOld = await requestThroughGateway(ctx.gatewayPort!, `pr-42-${appSlug}.localhost`, '/version');
-    expect(servedOld.body.trim()).toBe('rev-a');
+    expect(servedOld.body.trim()).toBe('revision-a');
 
     const upd = await sendWebhook('pull_request', prPayload('synchronize', 42, shaRev(1)));
     expect(upd.statusCode).toBe(200);
@@ -213,7 +213,7 @@ describe('preview environments via GitHub webhooks (real docker)', () => {
     // Same URL now serves the NEW revision.
     const servedNew = await requestThroughGateway(ctx.gatewayPort!, `pr-42-${appSlug}.localhost`, '/version');
     expect(servedNew.status).toBe(200);
-    expect(servedNew.body.trim()).toBe('rev-b');
+    expect(servedNew.body.trim()).toBe('revision-b');
 
     // The replaced preview deployment must not keep serving.
     await waitForDeploymentStatus(ctx, oldDepId, ['STOPPED'], 60_000);
@@ -255,6 +255,9 @@ describe('preview environments via GitHub webhooks (real docker)', () => {
   it('PR closed → route disappears, containers removed, env closed', async () => {
     const close = await sendWebhook('pull_request', prPayload('closed', 43, shaRev(0)));
     expect(close.statusCode).toBe(200);
+    // Surface the handler's decision: an early-exit here means cleanup did
+    // not run and the assertions below would fail for a hidden reason.
+    expect(close.json().ignored).toBeUndefined();
 
     const env = (await previewsList()).find((p) => p.prNumber === 43)!;
     expect(env.status).toBe('closed');
@@ -278,6 +281,6 @@ describe('preview environments via GitHub webhooks (real docker)', () => {
   it('PR #42 remains serving after unrelated PR #43 was closed', async () => {
     const served = await requestThroughGateway(ctx.gatewayPort!, `pr-42-${appSlug}.localhost`, '/version');
     expect(served.status).toBe(200);
-    expect(served.body.trim()).toBe('rev-b');
+    expect(served.body.trim()).toBe('revision-b');
   }, 60_000);
 });

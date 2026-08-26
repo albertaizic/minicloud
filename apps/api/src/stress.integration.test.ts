@@ -98,6 +98,11 @@ describe('queue stress: 3 apps, 10+ requests, concurrency 2 (real docker)', () =
     const jobs = await ctx.db.query<{ status: string }>('SELECT DISTINCT status FROM deployment_jobs');
     for (const row of jobs.rows) expect(TERMINAL_JOB).toContain(row.status);
 
+    // The always-failing app serves 500s but still answers HTTP, so its
+    // pipeline legitimately reaches RUNNING; the intentional crash afterwards
+    // is caught by the crash monitor. Tests disable the background monitor
+    // and drive one tick explicitly (deterministic, same as other suites).
+    await ctx.engine.checkCrashes();
     // Failures did happen (failing-app) and success happened too…
     const outcomes = await ctx.db.query<{ status: string; count: string }>(
       'SELECT status, COUNT(*)::text AS count FROM deployments GROUP BY status',
