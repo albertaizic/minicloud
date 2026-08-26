@@ -12,12 +12,16 @@ import {
   type ApplicationRow,
   type DeploymentRow,
   type DeploymentServiceRow,
+  JOB_PRIORITY,
 } from '@minicloud/db';
 import {
   DeploymentEngine,
+  DeploymentQueue,
+  defaultQueueConfigFromEnv,
   type EngineConfig,
   type LogListener,
 } from '@minicloud/deployment-engine';
+import { PreviewRepository, WebhookDeliveryRepository } from '@minicloud/db';
 import { DockerRuntime } from '@minicloud/docker-runtime';
 import { Gateway, slugFromHost } from '@minicloud/gateway';
 import { registerAutoDeployRoutes } from './auto-deploy.js';
@@ -96,6 +100,8 @@ function serializeDeployment(row: DeploymentRow, opts: { isActive?: boolean; ser
     autoRestartCount: row.auto_restart_count,
     rollbackOf: row.rollback_of_deployment_id,
     multiService: row.manifest_snapshot !== null,
+    buildCache: row.build_cache ?? null,
+    previewEnvironmentId: row.preview_environment_id ?? null,
     services: opts.services ?? null,
     config: serializeSnapshot(row.config_snapshot),
     createdAt: row.created_at,
@@ -150,7 +156,30 @@ export async function buildApp(opts: BuildAppOptions): Promise<FastifyInstance> 
   const servicesFor = async (deploymentId: string) =>
     (await services.listByDeployment(deploymentId)).map(serializeServiceRow);
 
-  registerAutoDeployRoutes(app, { apps, deployments, events, engine });
+  // Persistent deployment queue (v0.7): owns WHEN pipelines run.
+  const previews = new PreviewRepository(db);
+  const deliveries = new WebhookDeliveryRepository(db);
+  const queue = new DeploymentQueue(
+    db,
+    engine,
+    {
+      info: (msg, obj) => app.log.info(obj ?? {}, msg),
+      warn: (msg, obj) => app.log.warn(obj ?? {}, msg),
+      error: (msg, obj) => app.log.error(obj ?? {}, msg),
+    },
+    defaultQueueConfigFromEnv(),
+  );
+  (app as FastifyInstance & { minicloudQueue?: DeploymentQueue }).minicloudQueue = queue;
+
+  registerAutoDeployRoutes(app, {
+    apps,
+    deployments,
+    events,
+    engine,
+    queue,
+    previews,
+    deliveries,
+  });
 
   // Application-traffic gateway: stable <slug>.localhost:<gwPort> URLs routed
   // to the active deployment. Upstreams come only from deployment state.
@@ -439,6 +468,11 @@ export async function buildApp(opts: BuildAppOptions): Promise<FastifyInstance> 
     }
     try {
       const dep = await engine.rollbackDeployment(id, targetId);
+      await queue.enqueueDeployment(dep.id, id, {
+        trigger: 'manual',
+        priority: JOB_PRIORITY.rollback,
+        desiredRef: dep.ref,
+      });
       req.log.info({ deploymentId: dep.id, appId: id, rollbackOf: targetId }, 'rollback queued');
       return reply.code(202).send({
         deployment: serializeDeployment(dep),
@@ -583,17 +617,59 @@ export async function buildApp(opts: BuildAppOptions): Promise<FastifyInstance> 
     if (!parsed.success) {
       return reply.code(400).send({ error: 'Invalid request', details: parsed.error.flatten().fieldErrors });
     }
-    const dep = await deployments.create(id, {
-      ref: parsed.data.ref,
-      healthPath: parsed.data.healthPath,
-      containerPort: parsed.data.containerPort,
+    // v0.7: the deployment enters the persistent queue; a worker claims it
+    // subject to MINICLOUD_MAX_CONCURRENT_BUILDS and per-app serialization.
+    const { deploymentId, jobId } = await queue.createAndEnqueue(id, {
+      trigger: 'manual',
+      priority: JOB_PRIORITY.manual,
+      desiredRef: parsed.data.ref ?? 'HEAD',
+      healthPath: parsed.data.healthPath ?? null,
+      containerPort: parsed.data.containerPort ?? null,
     });
-    req.log.info({ deploymentId: dep.id, appId: id }, 'deployment created');
-    // Fire-and-forget; progress is observable through GET /api/deployments/:id.
-    void engine.runDeployment(dep.id).catch((err) => {
-      req.log.error({ deploymentId: dep.id, error: String(err) }, 'pipeline crashed unexpectedly');
+    req.log.info({ deploymentId, jobId, appId: id }, 'deployment queued');
+    const dep = await deployments.byId(deploymentId);
+    return reply.code(202).send({
+      deployment: serializeDeployment(dep!),
+      jobId,
+      message: 'Deployment queued',
     });
-    return reply.code(202).send({ deployment: serializeDeployment(dep), message: 'Deployment queued' });
+  });
+
+  // ---- deployment cancellation (v0.7) ----------------------------------------
+  app.post('/api/deployments/:id/cancel', async (req, reply) => {
+    const { id } = req.params as { id: string };
+    if (!isValidId(id)) return reply.code(400).send({ error: 'Invalid deployment id' });
+    const row = await deployments.byId(id);
+    if (!row) return reply.code(404).send({ error: 'Deployment not found' });
+    try {
+      const result = await queue.cancelByDeployment(id, 'cancelled via API');
+      const fresh = await deployments.byId(id);
+      return reply.code(200).send({
+        deploymentId: id,
+        result,
+        status: fresh?.status,
+      });
+    } catch (err) {
+      if (err instanceof Error && /RUNNING/.test(err.message)) {
+        return reply.code(409).send({
+          error: err.message,
+          hint: 'Use POST /api/deployments/:id/stop (or rollback) for a RUNNING deployment.',
+        });
+      }
+      throw err;
+    }
+  });
+
+  // ---- queue observability (v0.7) ---------------------------------------------
+  app.get('/api/queue', async () => {
+    return queue.snapshot();
+  });
+
+  app.get('/api/apps/:id/queue', async (req, reply) => {
+    const { id } = req.params as { id: string };
+    if (!isValidId(id)) return reply.code(400).send({ error: 'Invalid application id' });
+    if (!(await apps.byId(id))) return reply.code(404).send({ error: 'Application not found' });
+    return queue.snapshot(id);
   });
 
   // ---- deployments --------------------------------------------------------
@@ -698,6 +774,49 @@ export async function buildApp(opts: BuildAppOptions): Promise<FastifyInstance> 
     await apps.setGitConfig(id, opts);
     const updated = await apps.byId(id);
     return { branch: updated!.git_branch, autoDeploy: updated!.auto_deploy };
+  });
+
+  // ---- preview environments (v0.7) --------------------------------------------
+  app.get('/api/apps/:id/previews', async (req, reply) => {
+    const { id } = req.params as { id: string };
+    if (!isValidId(id)) return reply.code(400).send({ error: 'Invalid application id' });
+    if (!(await apps.byId(id))) return reply.code(404).send({ error: 'Application not found' });
+    const envs = await previews.listByApp(id);
+    return {
+      applicationId: id,
+      previews: await Promise.all(envs.map(async (env) => ({
+        id: env.id,
+        prNumber: env.pr_number,
+        headSha: env.head_sha,
+        branch: env.branch,
+        status: env.status,
+        url: gwPort > 0 ? `http://${env.route_slug}.localhost:${gwPort}` : null,
+        activeDeploymentId: env.active_preview_deployment_id,
+        createdAt: env.created_at,
+        updatedAt: env.updated_at,
+        closedAt: env.closed_at,
+      }))),
+    };
+  });
+
+  // Manual preview cleanup (same semantics as PR close).
+  app.delete('/api/apps/:id/previews/:pr', async (req, reply) => {
+    const { id, pr } = req.params as { id: string; pr: string };
+    if (!isValidId(id) || !/^\d+$/.test(pr)) return reply.code(400).send({ error: 'Invalid request' });
+    const env = await previews.byAppAndPr(id, Number(pr));
+    if (!env) return reply.code(404).send({ error: 'No preview environment for this PR' });
+    if (env.status === 'closed') return reply.code(200).send({ closed: true });
+    const history = await deployments.listByPreviewEnvironment(env.id);
+    for (const dep of history) {
+      if (!['FAILED', 'STOPPED', 'CANCELLED', 'RUNNING'].includes(dep.status)) {
+        await queue.cancelByDeployment(dep.id, 'preview deleted').catch(() => {});
+      }
+    }
+    if (env.active_preview_deployment_id) {
+      await engine.teardownPreviewDeployment(env.active_preview_deployment_id);
+    }
+    await previews.setStatus(env.id, 'closed');
+    return reply.code(200).send({ closed: true, prNumber: Number(pr) });
   });
 
   // ---- volumes & services (v0.5) --------------------------------------------
@@ -832,6 +951,7 @@ export async function buildApp(opts: BuildAppOptions): Promise<FastifyInstance> 
   monitor.unref();
 
   app.addHook('onClose', async () => {
+    queue.stop();
     clearInterval(monitor);
     logListeners.clear();
   });

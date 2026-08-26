@@ -31,11 +31,21 @@ async function main(): Promise<void> {
     gatewayPort: Number(process.env.GATEWAY_PORT ?? 8080),
   });
 
-  // Startup reconciliation: DB vs Docker truth sync.
+  // Startup reconciliation first: DB rows agree with Docker reality. Queue
+  // recovery then finalizes/requeues jobs orphaned by the restart, and only
+  // then does the scheduler start claiming new work.
   try {
     await engine.reconcile();
   } catch (err) {
     logger.error('startup reconciliation failed', { error: String(err) });
+  }
+
+  const queue = (app as import('fastify').FastifyInstance & { minicloudQueue?: import('@minicloud/deployment-engine').DeploymentQueue }).minicloudQueue;
+  if (queue) {
+    await queue.recoverAfterRestart();
+    queue.start();
+  } else {
+    logger.warn('deployment queue not attached; skipping scheduler startup');
   }
 
   const port = Number(process.env.PORT ?? 4000);
