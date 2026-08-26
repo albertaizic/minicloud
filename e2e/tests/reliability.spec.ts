@@ -183,8 +183,21 @@ test.describe.serial('reliability UI flows (real stack)', () => {
     await targetRow.getByRole('button', { name: /^yes$/i }).click();
 
     await expect(page.getByText('RUNNING').first()).toBeVisible({ timeout: 240_000 });
-    const detail = (await apiGet(`/api/apps/${rbApp}`)) as { activeDeploymentId: string };
-    expect(detail.activeDeploymentId).not.toBe(depB);
+    // The rollback deployment builds/reuses then cuts over asynchronously —
+    // poll for the pointer to LEAVE depB instead of racing it.
+    let active = '';
+    let rolledBackTo = '';
+    for (let i = 0; i < 240; i++) {
+      const appRow = (await apiGet(`/api/apps/${rbApp}`)) as { activeDeploymentId: string; deployments: Array<{ id: string; isActive: boolean; rollbackOf: string | null }> };
+      active = appRow.activeDeploymentId ?? '';
+      if (active && active !== depB) {
+        rolledBackTo = appRow.deployments.find((d) => d.isActive)?.rollbackOf ?? '';
+        if (rolledBackTo === depA) break;
+      }
+      await new Promise((r) => setTimeout(r, 500));
+    }
+    expect(active).not.toBe(depB);
+    expect(rolledBackTo).toBe(depA);
     await apiDelete(`/api/apps/${rbApp}`);
   });
 });
