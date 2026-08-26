@@ -48,9 +48,8 @@ test.describe.serial('multi-service + zero-downtime UI (real stack)', () => {
     // sample until the flip instead of asserting an instantaneous snapshot;
     // any version observed before B reaches RUNNING must be msvc-A.
     const preFlip: string[] = [];
-    for (let i = 0; i < 240; i++) {
       const depRow = (await apiGet(`/api/deployments/${depB}`)) as { status: string };
-      if (['RUNNING', 'FAILED', 'CANCELLED', 'STOPPED'].includes(depRow.status)) break;
+      if (!['QUEUED', 'CLONING', 'BUILDING'].includes(depRow.status)) break;
       const during = await appUrl('e2e-msvc');
       if (during.status === 200) preFlip.push(JSON.parse(during.body).version);
       await new Promise((r) => setTimeout(r, 500));
