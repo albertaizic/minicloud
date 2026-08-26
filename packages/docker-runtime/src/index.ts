@@ -116,6 +116,24 @@ export class DockerRuntime {
     );
   }
 
+  /** Every daemon round-trip is bounded: a hung pipe call must never wedge a
+   *  deployment pipeline or a queue slot. */
+  private readonly opTimeoutMs = Number(process.env.MINICLOUD_DOCKER_OP_TIMEOUT_MS ?? 60_000);
+
+  private timed<T>(op: Promise<T>, what: string): Promise<T> {
+    let timer: NodeJS.Timeout | undefined;
+    const expiry = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new DockerUnavailableError(`${what} timed out after ${this.opTimeoutMs}ms`)), this.opTimeoutMs);
+    });
+    return Promise.race([
+      op.then(
+        (v) => { clearTimeout(timer); return v as T; },
+        (e) => { clearTimeout(timer); throw e; },
+      ),
+      expiry,
+    ]);
+  }
+
   async ping(): Promise<void> {
     try {
       await this.docker.ping();
@@ -204,7 +222,7 @@ export class DockerRuntime {
   async startManagedContainer(o: StartContainerOptions): Promise<{ id: string }> {
     try {
       const publishesPort = o.containerPort > 0 && o.hostPort > 0;
-      const container = await this.docker.createContainer({
+      const container = await this.timed(this.docker.createContainer({
         Image: o.image,
         name: o.name,
         Labels: {
@@ -237,8 +255,8 @@ export class DockerRuntime {
           RestartPolicy: { Name: 'no' },
           // Deliberately no Binds: user containers never receive host mounts.
         },
-      });
-      await container.start();
+      }), "container.create");
+      await this.timed(container.start(), "container.start");
       // Join MiniCloud-managed networks with the service alias AFTER start
       // (dockerode connect works on running containers).
       for (const net of o.networks ?? []) {
@@ -296,7 +314,7 @@ export class DockerRuntime {
     limits: { memoryBytes: number | null; memorySwapBytes: number | null; nanoCpus: number | null };
   } | null> {
     try {
-      const info = await this.docker.getContainer(id).inspect();
+      const info = await this.timed(this.docker.getContainer(id).inspect(), "container.inspect");
       return {
         env: info.Config?.Env ?? [],
         state: {
@@ -320,7 +338,7 @@ export class DockerRuntime {
   async stop(id: string, timeoutSeconds = 10): Promise<boolean> {
     try {
       const container = this.docker.getContainer(id);
-      await container.stop({ t: timeoutSeconds });
+      await this.timed(container.stop({ t: timeoutSeconds }), "container.stop");
       return true;
     } catch (err) {
       const status = (err as { statusCode?: number }).statusCode;
@@ -331,7 +349,7 @@ export class DockerRuntime {
 
   async remove(id: string, force = false): Promise<boolean> {
     try {
-      await this.docker.getContainer(id).remove({ force });
+      await this.timed(this.docker.getContainer(id).remove({ force }), "container.remove");
       return true;
     } catch (err) {
       const status = (err as { statusCode?: number }).statusCode;
