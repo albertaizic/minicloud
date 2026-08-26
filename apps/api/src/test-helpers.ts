@@ -104,6 +104,27 @@ export async function waitUntilContainerExited(
 }
 
 export async function destroyTestContext(ctx: TestContext): Promise<void> {
+  // Remove this context's managed containers BEFORE the database vanishes:
+  // afterwards their deployment rows are gone and they would linger as
+  // orphans until an explicit prune.
+  await ctx.docker
+    .listManagedContainers()
+    .then(async (containers) => {
+      const ids = new Set(
+        (
+          await ctx.db
+            .query<{ id: string }>('SELECT id FROM deployments')
+            .catch(() => ({ rows: [] as Array<{ id: string }> }))
+        ).rows.map((r) => r.id),
+      );
+      for (const c of containers) {
+        const depId = c.labels['minicloud.deployment'] ?? '';
+        if (!ids.has(depId)) continue; // not ours (foreign labels are left alone)
+        await ctx.docker.stop(c.id).catch(() => {});
+        await ctx.docker.remove(c.id, true).catch(() => {});
+      }
+    })
+    .catch(() => {});
   await closeTestContext(ctx);
   const admin = new pg.Pool({ connectionString: ADMIN_URL });
   // Terminate remaining connections before dropping.

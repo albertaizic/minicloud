@@ -4,18 +4,25 @@
 //   C. small source-only change
 // Run: npx tsx scripts/cache-acceptance.ts   (needs Docker + Postgres up)
 import 'dotenv/config';
+import type { DeploymentQueue } from '@minicloud/deployment-engine';
 import { startFixtureServer } from '../src/fixture-server.js';
 import { createTestApp, destroyTestContext, type TestContext } from '../src/test-helpers.js';
 
-async function timedDeploy(ctx: TestContext, q: import('@minicloud/deployment-engine').DeploymentQueue, appId: string, sha: string): Promise<{ ms: number; status: string; cache: string | null }> {
+function q(ctx: TestContext): DeploymentQueue {
+  const queue = (ctx.app as unknown as { minicloudQueue?: DeploymentQueue }).minicloudQueue;
+  if (!queue) throw new Error('queue not attached');
+  return queue;
+}
+
+async function timedDeploy(ctx: TestContext, queue: DeploymentQueue, appId: string, sha: string): Promise<{ ms: number; status: string; cache: string | null }> {
   const started = Date.now();
-  const { deploymentId } = await q.createAndEnqueue(appId, { trigger: 'manual', desiredRef: sha, commitSha: sha });
-  q.start();
+  const { deploymentId } = await queue.createAndEnqueue(appId, { trigger: 'manual', desiredRef: sha, commitSha: sha });
+  queue.start();
   for (;;) {
     const res = await ctx.app.inject({ method: 'GET', url: `/api/deployments/${deploymentId}` });
     const body = res.json();
     if (['RUNNING', 'FAILED', 'CANCELLED', 'STOPPED'].includes(body.status)) {
-      q.stop();
+      queue.stop();
       return { ms: Date.now() - started, status: body.status as string, cache: body.buildCache ?? null };
     }
     if (Date.now() - started > 300_000) throw new Error('timeout');
