@@ -137,6 +137,7 @@ export default function ConfigPanel({ appId }: { appId: string }) {
       </p>
       <form
         className="actions"
+        noValidate
         onSubmit={(e) => {
           e.preventDefault();
           const payload: { memoryLimitMb?: number; cpuLimit?: number } = {};

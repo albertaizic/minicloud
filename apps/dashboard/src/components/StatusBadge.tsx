@@ -7,6 +7,7 @@ const CLASS: Record<string, string> = {
   RUNNING: 'running',
   FAILED: 'failed',
   STOPPED: 'stopped',
+  CANCELLED: 'stopped',
 };
 
 const LABELS: Record<string, string> = {
@@ -18,6 +19,7 @@ const LABELS: Record<string, string> = {
   RUNNING: 'running',
   FAILED: 'failed',
   STOPPED: 'stopped',
+  CANCELLED: 'cancelled',
 };
 
 export default function StatusBadge({ status }: { status: string }) {

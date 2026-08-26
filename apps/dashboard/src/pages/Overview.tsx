@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { api, type AppDto } from '../api.js';
+import QueuePanel from '../components/QueuePanel.js';
 import StatusBadge from '../components/StatusBadge.js';
 
 export default function Overview() {
@@ -63,6 +64,10 @@ export default function Overview() {
           ))}
         </tbody>
       </table>
+      <h2>Build queue</h2>
+      <QueuePanel />
+
     </div>
+
   );
 }

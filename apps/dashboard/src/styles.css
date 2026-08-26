@@ -82,5 +82,22 @@ dd { margin: 0; font-size: 14px; }
   font-size: 12.5px; line-height: 1.5; white-space: pre-wrap; word-break: break-all;
 }
 .log-empty { color: var(--dim); }
+
 .log-line.log-build { color: #79c0ff; }
 .log-line.log-system { color: var(--yellow); }
+
+/* ---- small viewports (390×844 and similar) -------------------------------- */
+@media (max-width: 640px) {
+  .shell { padding: 0 12px; }
+  .topbar { flex-wrap: wrap; row-gap: 4px; }
+  .tagline { display: none; }
+  h1 { font-size: 19px; }
+  /* Wide tables scroll horizontally instead of overflowing the page. */
+  .table { display: block; overflow-x: auto; white-space: nowrap; }
+  /* Definition lists stack so long values never clip. */
+  dl { grid-template-columns: 1fr; }
+  dt { margin-top: 6px; }
+  .new-app-form { flex-direction: column; }
+  .new-app-form input[style] { flex: none !important; }
+  .actions { flex-wrap: wrap; }
+}

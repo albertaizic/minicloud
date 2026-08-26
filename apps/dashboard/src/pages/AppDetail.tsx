@@ -2,6 +2,8 @@ import { useCallback, useEffect, useState } from 'react';
 import { Link, useParams } from 'react-router-dom';
 import { api } from '../api.js';
 import ConfigPanel from '../components/ConfigPanel.js';
+import PreviewsPanel from '../components/PreviewsPanel.js';
+import QueuePanel from '../components/QueuePanel.js';
 import StatusBadge from '../components/StatusBadge.js';
 
 /** Restart policy selector: disabled | on-failure with a bounded attempt budget. */
@@ -36,6 +38,7 @@ function RestartPolicyEditor({ appId, initial }: { appId: string; initial: { pol
       </p>
       <form
         className="actions"
+        noValidate
         onSubmit={(e) => {
           e.preventDefault();
           void save();
@@ -47,6 +50,7 @@ function RestartPolicyEditor({ appId, initial }: { appId: string; initial: { pol
         </select>
         <input
           type="number"
+          aria-label="max restart attempts"
           min={0}
           max={10}
           value={max}
@@ -137,6 +141,12 @@ export default function AppDetail() {
       </p>
       <h2>Restart policy</h2>
       <RestartPolicyEditor appId={data.id} initial={{ policy: data.restartPolicy, maxRestartAttempts: data.maxRestartAttempts }} />
+      <h2>Queue</h2>
+      <QueuePanel appId={data.id} />
+
+      <h2>Preview environments</h2>
+      <PreviewsPanel appId={data.id} />
+
 
       <h2>Configuration</h2>
       <ConfigPanel appId={data.id} />

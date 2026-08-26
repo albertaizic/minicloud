@@ -55,6 +55,8 @@ export interface DeploymentDto {
   autoRestartCount: number;
   rollbackOf: string | null;
   isActive: boolean;
+  buildCache: 'miss' | 'partial' | 'image_reused' | null;
+  previewEnvironmentId: string | null;
   multiService: boolean;
   services: Array<{
     service: string;
@@ -94,6 +96,36 @@ export interface MetricsDto {
 export interface RestartPolicyDto {
   policy: string;
   maxRestartAttempts: number;
+}
+
+export interface QueueJobDto {
+  jobId: string;
+  deploymentId: string;
+  applicationId: string;
+  status: string;
+  trigger: string;
+  priority: number;
+  position: number | null;
+  createdAt: string;
+}
+
+export interface QueueSnapshotDto {
+  limit: number;
+  running: QueueJobDto[];
+  queued: QueueJobDto[];
+}
+
+export interface PreviewEnvDto {
+  id: string;
+  prNumber: number;
+  headSha: string | null;
+  branch: string | null;
+  status: 'creating' | 'active' | 'closed';
+  url: string | null;
+  activeDeploymentId: string | null;
+  createdAt: string;
+  updatedAt: string;
+  closedAt: string | null;
 }
 
 async function req<T>(path: string, init?: RequestInit): Promise<T> {
@@ -147,6 +179,13 @@ export const api = {
       method: 'PUT',
       body: JSON.stringify({ policy, ...(maxRestartAttempts !== undefined ? { maxRestartAttempts } : {}) }),
     }),
+  getQueue: (appId?: string) =>
+    req<QueueSnapshotDto>(appId ? `/api/apps/${appId}/queue` : '/api/queue'),
+  cancelDeployment: (id: string) =>
+    req<{ deploymentId: string; result: string; status: string }>(`/api/deployments/${id}/cancel`, { method: 'POST' }),
+  listPreviews: (appId: string) => req<{ previews: PreviewEnvDto[] }>(`/api/apps/${appId}/previews`),
+  deletePreview: (appId: string, prNumber: number) =>
+    req<{ closed: boolean }>(`/api/apps/${appId}/previews/${prNumber}`, { method: 'DELETE' }),
 };
 
 export const configApi = {

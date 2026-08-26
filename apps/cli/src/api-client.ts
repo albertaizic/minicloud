@@ -224,6 +224,52 @@ export const reliabilityApi = {
     }>('GET', '/api/routes'),
 };
 
+// ---- deployment queue & previews (v0.7) --------------------------------------
+
+export interface QueueJobDto {
+  jobId: string;
+  deploymentId: string;
+  applicationId: string;
+  status: string;
+  trigger: string;
+  priority: number;
+  position: number | null;
+  createdAt: string;
+}
+
+export interface QueueSnapshotDto {
+  limit: number;
+  running: QueueJobDto[];
+  queued: QueueJobDto[];
+}
+
+export interface PreviewEnvDto {
+  id: string;
+  prNumber: number;
+  headSha: string | null;
+  branch: string | null;
+  status: string;
+  url: string | null;
+  activeDeploymentId: string | null;
+  createdAt: string;
+  updatedAt: string;
+  closedAt: string | null;
+}
+
+export const queueApi = {
+  snapshot: (appId?: string) =>
+    request<QueueSnapshotDto>('GET', appId ? `/api/apps/${appId}/queue` : '/api/queue'),
+  cancel: (deploymentId: string) =>
+    request<{ result: string; status: string }>('POST', `/api/deployments/${deploymentId}/cancel`),
+};
+
+export const previewApi = {
+  list: (appId: string) =>
+    request<{ previews: PreviewEnvDto[] }>('GET', `/api/apps/${appId}/previews`),
+  remove: (appId: string, prNumber: number) =>
+    request<{ closed: boolean }>('DELETE', `/api/apps/${appId}/previews/${prNumber}`),
+};
+
 // ---- application configuration (env / secrets / limits) --------------------
 
 export const configApi = {

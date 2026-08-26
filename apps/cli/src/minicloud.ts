@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // minicloud CLI
-import { api, ApiError, configApi, reliabilityApi, resolveAppId, resolveDeploymentId, assertPlausibleId, type AppDto, type DeploymentDto, type LimitsDto } from './api-client.js';
+import { api, ApiError, configApi, queueApi, previewApi, reliabilityApi, resolveAppId, resolveDeploymentId, assertPlausibleId, type AppDto, type DeploymentDto, type LimitsDto } from './api-client.js';
 
 const c = (code: string) => (s: string) => `\x1b[${code}m${s}\x1b[0m`;
 const bold = c('1');
@@ -33,9 +33,14 @@ Usage:
   minicloud stop <deployment-id>         Stop a deployment
   minicloud restart <deployment-id>      Restart a deployment
   minicloud delete <deployment-id>       Delete a deployment
+  minicloud cancel <deployment-id>       Cancel queued or in-flight work
   minicloud wait <deployment-id>         Wait for a deployment to finish
 
-  minicloud limits clear <app>           Remove limits
+Queue & previews (v0.7):
+  minicloud queue [app]                  Show the build queue (running + waiting)
+  minicloud previews <app>               List pull-request preview environments
+  minicloud preview-delete <app> <PR#>   Close a preview and clean its resources
+
 
 Reliability & observability:
   minicloud events <deployment-id>       Lifecycle event timeline
@@ -46,6 +51,9 @@ Reliability & observability:
   minicloud prune [--yes]                Remove stopped containers, unreferenced
                                          MiniCloud images, stale workspaces
   minicloud routes                       Show gateway routing table
+
+  minicloud sync <app>                   Check remote for new commits and deploy
+  minicloud git-status <app>             Show git auto-deploy configuration
 
 Stable app URLs: http://<app>.localhost:<gateway-port> routes to whichever
 deployment is active. stop/delete of the ACTIVE deployment requires --force.
@@ -612,6 +620,48 @@ async function main(): Promise<void> {
           dim(`reqs ${s2.requests} · active ${s2.active} · 2xx ${s2.ok2xx} · 4xx ${s2.client4xx} · 5xx ${s2.server5xx}`),
         );
       }
+      return;
+    }
+    case 'cancel': {
+      // `minicloud cancel <deployment>`: queued/in-flight work, not RUNNING apps.
+      const id = await resolveDeploymentId(positional[0] ?? '');
+      const result = await queueApi.cancel(id);
+      if (result.result === 'cancelled') console.log(`${green('\u2714')} cancelled; deployment is now ${result.status}`);
+      else console.log(dim('deployment was already in a terminal state'));
+      return;
+    }
+    case 'queue': {
+      const appId = positional[0] ? await requireAppId(positional[0]) : undefined;
+      const snap = await queueApi.snapshot(appId);
+      console.log(bold(`QUEUE  limit ${snap.limit} concurrent`));
+      for (const j of snap.running) {
+        console.log(`${yellow('building'.padEnd(10))} ${short(j.deploymentId).padEnd(12)} ${dim(`trigger ${j.trigger}`)}`);
+      }
+      for (const j of snap.queued) {
+        const pos = j.position != null ? `position ${j.position}` : '';
+        console.log(`${cyan('queued'.padEnd(10))}   ${short(j.deploymentId).padEnd(12)} ${dim(`trigger ${j.trigger}${pos ? ` · ${pos}` : ''}`)}`);
+        void j.priority;
+      }
+      if (snap.running.length === 0 && snap.queued.length === 0) console.log(dim('(empty)'));
+      return;
+    }
+    case 'previews': {
+      const appId = await requireAppId(positional[0] ?? '');
+      const { previews } = await previewApi.list(appId);
+      if (previews.length === 0) return console.log('no preview environments');
+      for (const p of previews) {
+        const state = p.status.padEnd(9);
+        const line = `PR #${String(p.prNumber).padEnd(4)} ${state} ${p.headSha?.slice(0, 12) ?? '\u2014'}  ${p.url ?? ''}`;
+        console.log(p.status === 'closed' ? dim(line) : line);
+      }
+      return;
+    }
+    case 'preview-delete': {
+      const appId = await requireAppId(positional[0] ?? '');
+      const pr = Number(positional[1]);
+      if (!Number.isInteger(pr) || pr <= 0) fail('usage: minicloud preview-delete <app> <pr-number>');
+      await previewApi.remove(appId, pr);
+      console.log(`${green('\u2714')} preview for PR #${pr} closed and cleaned up`);
       return;
     }
     default:

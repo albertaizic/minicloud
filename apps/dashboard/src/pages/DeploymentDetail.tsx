@@ -69,6 +69,18 @@ export default function DeploymentDetail() {
             </>
           )}
           {dep.exitCode !== null && (<><dt>Exit code</dt><dd className="mono">{dep.exitCode}</dd></>)}
+          {dep.buildCache && (
+            <>
+              <dt>Build</dt>
+              <dd>
+                {dep.buildCache === 'image_reused'
+                  ? 'reused image (exact cache hit)'
+                  : dep.buildCache === 'partial'
+                    ? 'partial image reuse across services'
+                    : 'built from Dockerfile'}
+              </dd>
+            </>
+          )}
           {dep.failureReason && (<><dt>Failure</dt><dd className="error-text">{dep.failureReason}</dd></>)}
         </dl>
       </div>
