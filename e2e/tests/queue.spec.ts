@@ -60,15 +60,23 @@ function requestThroughGateway(port: number, host: string, path = '/health'): Pr
 test.describe.serial('queue & preview UI (v0.7)', () => {
   let appId: string;
   let slug: string;
+  let previewAppId: string;
+  let previewSlug: string;
 
   test.beforeAll(async () => {
     const made = await createAppWithWebhook(`e2e-q-${Date.now() % 100000}`, 'http://localhost:4555/hello-node.git');
     appId = made.appId;
     slug = made.slug;
+    // Preview webhooks reference the two-revision 'rev' fixture, so the
+    // application they must match is bound to that repository URL.
+    const prev = await createAppWithWebhook(`e2e-p-${Date.now() % 100000}`, 'http://localhost:4555/rev.git');
+    previewAppId = prev.appId;
+    previewSlug = prev.slug;
   });
 
   test.afterAll(async () => {
     await apiDelete(`/api/apps/${appId}`).catch(() => {});
+    await apiDelete(`/api/apps/${previewAppId}`).catch(() => {});
   });
 
   test('deployment enters queue, shows position/source, and can be cancelled while queued', async ({ page }) => {
@@ -157,7 +165,7 @@ test.describe.serial('queue & preview UI (v0.7)', () => {
     expect(previewDepId).toBeTruthy();
 
     // Dashboard: preview panel shows PR #7 with PREVIEW label and its own URL.
-    await page.goto(`/apps/${appId}`);
+    await page.goto(`/apps/${previewAppId}`);
     await expect(page.getByRole('heading', { name: /preview environments/i })).toBeVisible();
     const row = page.locator('tr', { hasText: 'PR #7' }).first();
     await expect(row).toBeVisible({ timeout: 30_000 });
@@ -169,8 +177,8 @@ test.describe.serial('queue & preview UI (v0.7)', () => {
       if (d.status === 'RUNNING') break;
       await new Promise((r) => setTimeout(r, 1000));
     }
-    const servedA = await requestThroughGateway(8080, `pr-7-${slug}.localhost`, '/version');
-    expect(servedA.body.trim()).toBe('rev-a');
+    const servedA = await requestThroughGateway(8080, `pr-7-${previewSlug}.localhost`, '/version');
+    expect(servedA.body.trim()).toBe('revision-a');
 
     // synchronize: same URL, new content.
     const sync = await sendPullRequest('synchronize', 7, rev1);
@@ -181,20 +189,20 @@ test.describe.serial('queue & preview UI (v0.7)', () => {
       if (d.status === 'RUNNING') break;
       await new Promise((r) => setTimeout(r, 1000));
     }
-    const servedB = await requestThroughGateway(8080, `pr-7-${slug}.localhost`, '/version');
-    expect(servedB.body.trim()).toBe('rev-b');
+    const servedB = await requestThroughGateway(8080, `pr-7-${previewSlug}.localhost`, '/version');
+    expect(servedB.body.trim()).toBe('revision-b');
 
     // The dashboard reflects the new head SHA on the preview row.
-    await page.goto(`/apps/${appId}`);
+    await page.goto(`/apps/${previewAppId}`);
     await expect(page.locator('tr', { hasText: 'PR #7' }).first().getByText(rev1.slice(0, 12))).toBeVisible({ timeout: 20_000 });
 
     // close: route disappears; panel marks it closed.
     const close = await sendPullRequest('closed', 7, rev1);
     expect(close.status).toBe(200);
-    const goneAfterClose = await requestThroughGateway(8080, `pr-7-${slug}.localhost`);
+    const goneAfterClose = await requestThroughGateway(8080, `pr-7-${previewSlug}.localhost`);
     expect(goneAfterClose.status).toBe(503);
 
-    await page.goto(`/apps/${appId}`);
+    await page.goto(`/apps/${previewAppId}`);
     await expect(page.locator('tr', { hasText: 'PR #7' }).first().getByText(/closed/i)).toBeVisible({ timeout: 30_000 });
   });
 });
