@@ -103,8 +103,14 @@ describe('queue stress: 3 apps, 10+ requests, concurrency 2 (real docker)', () =
       'SELECT status, COUNT(*)::text AS count FROM deployments GROUP BY status',
     );
     const byStatus = new Map(outcomes.rows.map((r) => [r.status, Number(r.count)]));
-    expect(byStatus.get('FAILED') ?? 0).toBeGreaterThanOrEqual(3); // failing-app burst
+    // Superseding coalesces the 3 git-triggered deploys of the always-failing
+    // app into a single execution: exactly one FAILED deployment results.
+    expect(byStatus.get('FAILED') ?? 0).toBe(1);
     expect(byStatus.get('RUNNING') ?? 0).toBeGreaterThanOrEqual(2); // healthy apps served
+    const supersededJobs = await ctx.db.query<{ n: string }>(
+      "SELECT COUNT(*)::text AS n FROM deployment_jobs WHERE status = 'superseded'",
+    );
+    expect(Number(supersededJobs.rows[0]?.n ?? 0)).toBeGreaterThanOrEqual(2);
 
     // …and the scheduler still works after all of it: one more deploy runs.
     const extra = await q0.createAndEnqueue(appIds[0]!, { trigger: 'manual', desiredRef: 'HEAD' });

@@ -125,6 +125,9 @@ async function handlePullRequest(
         previewEnvironmentId: env.id,
       });
     }
+    // Drop the guarded pointer first, then mark the logical env closed.
+    await deps.previews.closeIfActive(env.id, env.active_preview_deployment_id ?? '');
+    await deps.previews.setStatus(env.id, 'closed');
     return { handled: true, detail: 'preview closed' };
   }
 
@@ -141,6 +144,12 @@ async function handlePullRequest(
   const branch = payload.pull_request?.head?.ref ?? null;
   const app = await deps.apps.byId(appId);
   if (!app) return { handled: false, detail: 'application vanished' };
+  // Previews only track PRs targeting the application's configured branch.
+  const baseRef = payload.pull_request?.base?.ref ?? null;
+  if (!baseRef || baseRef !== app.git_branch) {
+    return { handled: false, detail: `base branch "${baseRef ?? '?'}" not tracked` };
+  }
+
   const routeSlug = previewRouteSlug(prNumber, app.route_slug ?? app.name);
   const logical = await deps.previews.upsert(appId, prNumber, { headSha, branch, routeSlug });
   const { deploymentId } = await deps.queue.createAndEnqueue(appId, {
