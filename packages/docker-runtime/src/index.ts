@@ -138,6 +138,10 @@ export class DockerRuntime {
           t: opts.tag,
           rm: true,
           forcerm: true,
+          // BuildKit endpoint (/build?version=2): the legacy builder's
+          // completion callback lags the real end by tens of seconds on
+          // Windows named pipes.
+          version: '2',
           ...(opts.dockerfile && opts.dockerfile !== 'Dockerfile' ? { dockerfile: opts.dockerfile } : {}),
         },
       );
