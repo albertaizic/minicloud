@@ -10,7 +10,7 @@ const TSX = path.join(ROOT, 'node_modules', 'tsx', 'dist', 'cli.mjs');
 const VITE = path.join(ROOT, 'node_modules', 'vite', 'bin', 'vite.js');
 
 export default defineConfig({
-  testDir: './tests',
+  globalSetup: './helpers/global-setup.mjs',
   globalTeardown: './helpers/global-teardown.mjs',
   timeout: 600_000,
   expect: { timeout: 15_000 },
