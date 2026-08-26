@@ -55,7 +55,7 @@ test.describe.serial('multi-service + zero-downtime UI (real stack)', () => {
       if (during.status === 200) preFlip.push(JSON.parse(during.body).version);
       await new Promise((r) => setTimeout(r, 500));
     }
-    expect(preFlip.every((v) => v === 'msvc-A')).toBe(true);
+    expect(preFlip.every((v) => v === 'msvc-A'), `preFlip samples: ${JSON.stringify(preFlip)}`).toBe(true);
 
     // B becomes healthy: badge moves.
     await waitForDeploymentStatus(depB, ['RUNNING'], 300_000);
