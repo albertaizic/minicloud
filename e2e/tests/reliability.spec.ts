@@ -1,6 +1,6 @@
 import { test, expect } from '@playwright/test';
 import {
-  attachErrorCollectors, apiGet, apiDelete, deployViaApi,
+  attachErrorCollectors, apiGet, apiDelete, deployViaApi, API,
   waitForDeploymentStatus, appUrl, expectNoErrors,
 } from '../helpers/support.js';
 
@@ -80,8 +80,26 @@ test.describe.serial('reliability UI flows (real stack)', () => {
 
   test('automatic recovery: crash-once fixture returns to RUNNING in the UI', async ({ page }) => {
     test.setTimeout(420_000);
+    // Earlier specs bind 'e2e-rel' to hello-node; automatic recovery needs
+    // the crash-once fixture. Recreate on mismatch, then set the policy —
+    // recreation wipes application-scoped settings.
+    const apps = (await apiGet('/api/apps')) as Array<{ id: string; name: string; repositoryUrl?: string }>;
+    let rel = apps.find((a) => a.name === 'e2e-rel');
+    if (rel && rel.repositoryUrl !== `${FIX}/crash-once.git`) {
+      await apiDelete(`/api/apps/${rel.id}`);
+      rel = undefined;
+    }
+    if (!rel) {
+      const r = await fetch(`${API}/api/apps`, { method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ name: 'e2e-rel', repositoryUrl: `${FIX}/crash-once.git` }) });
+      rel = (await r.json()) as typeof rel;
+    }
+    appId = rel!.id;
+    await fetch(`${API}/api/apps/${appId}/restart-policy`, {
+      method: 'PUT', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ policy: 'on-failure', maxRestartAttempts: 3 }),
+    });
     const depId = await deployViaApi('e2e-rel', `${FIX}/crash-once.git`);
-    depIds.push(depId);
     await waitForDeploymentStatus(depId, ['RUNNING']);
 
     await page.goto(`/deployments/${depId}`);

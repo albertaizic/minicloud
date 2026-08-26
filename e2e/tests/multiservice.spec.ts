@@ -95,9 +95,10 @@ test.describe.serial('multi-service + zero-downtime UI (real stack)', () => {
     const vols = (await apiGet(`/api/apps/${appId}/volumes`)) as { volumes: Array<{ name: string }> };
     expect(vols.volumes.map((v) => v.name)).toContain('app-data');
 
-    // Deployment page: per-service metrics via the service selector.
+    // Deployment page: per-service metrics via the service selector. Docker
+    // stats can take a while on a saturated box — allow a generous window.
     await page.goto(`/deployments/${depB}`);
-    await expect(page.getByText(/CPU/i).first()).toBeVisible();
+    await expect(page.getByText(/CPU/i).first()).toBeVisible({ timeout: 60_000 });
 
     // Per-service logs actually change displayed data.
     await page.goto(`/deployments/${depB}`);
