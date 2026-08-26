@@ -113,6 +113,9 @@ export interface DeploymentRow {
   config_snapshot: Record<string, unknown> | null;
   rollback_of_deployment_id: string | null;
   manifest_snapshot: Record<string, unknown> | null;
+  preview_environment_id: string | null;
+  gateway_route_key: string | null;
+  build_cache: string | null;
   auto_restart_count: number;
   next_auto_restart_at: Date | null;
   created_at: Date;
@@ -238,11 +241,13 @@ export class DeploymentRepository {
       containerPort?: number;
       commitSha?: string | null;
       rollbackOf?: string | null;
+      previewEnvironmentId?: string | null;
+      gatewayRouteKey?: string | null;
     } = {},
   ): Promise<DeploymentRow> {
     const res = await this.db.query<DeploymentRow>(
-      `INSERT INTO deployments (application_id, ref, health_path, container_port, commit_sha, rollback_of_deployment_id, status)
-       VALUES ($1, $2, $3, $4, $5, $6, 'QUEUED') RETURNING *`,
+      `INSERT INTO deployments (application_id, ref, health_path, container_port, commit_sha, rollback_of_deployment_id, preview_environment_id, gateway_route_key, status)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'QUEUED') RETURNING *`,
       [
         applicationId,
         opts.ref ?? 'HEAD',
@@ -250,6 +255,8 @@ export class DeploymentRepository {
         opts.containerPort ?? null,
         opts.commitSha ?? null,
         opts.rollbackOf ?? null,
+        opts.previewEnvironmentId ?? null,
+        opts.gatewayRouteKey ?? null,
       ],
     );
     return res.rows[0]!;
@@ -336,6 +343,7 @@ export class DeploymentRepository {
       next_auto_restart_at: Date | null;
       config_snapshot: Record<string, unknown> | null;
       manifest_snapshot: Record<string, unknown> | null;
+      build_cache: string | null;
       started_at: Date | null;
       stopped_at: Date | null;
     }>,
@@ -371,6 +379,15 @@ export class DeploymentRepository {
       [applicationId],
     );
     return res.rows[0] ?? null;
+  }
+
+  /** All deployments belonging to a preview environment (history included). */
+  async listByPreviewEnvironment(previewEnvironmentId: string): Promise<DeploymentRow[]> {
+    const res = await this.db.query<DeploymentRow>(
+      'SELECT * FROM deployments WHERE preview_environment_id = $1 ORDER BY created_at ASC',
+      [previewEnvironmentId],
+    );
+    return res.rows;
   }
 }
 
@@ -587,5 +604,7 @@ export class DeploymentEventRepository {
     return Number(res.rows[0]?.count ?? 0);
   }
 }
+
+export * from './v07-repos.js';
 
 export * from './service-repos.js';
