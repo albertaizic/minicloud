@@ -4,7 +4,10 @@
 //
 // Correctness rule: an image may be reused only when this fingerprint matches
 // exactly. Content hashing (not timestamps) makes fingerprints stable across
-// fresh clones; excluding .git keeps shallow/full clones equal.
+// fresh clones; excluding .git keeps shallow/full clones equal. `node_modules`
+// is excluded too: committing it is an anti-pattern MiniCloud's examples never
+// follow, and hashing it would dominate fingerprint cost — a repo that DOES
+// commit dependencies changes its lockfile/manifests instead, which are hashed.
 //
 // Bounds keep pathological repositories safe: >5000 files or >64MB of hashed
 // content degrade to size-only entries for the remainder — still deterministic,

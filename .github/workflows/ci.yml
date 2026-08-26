@@ -94,7 +94,6 @@ jobs:
       - name: Run Playwright suite
         run: npm run test:e2e
         env:
-          DATABASE_URL: postgres://minicloud:minicloud@localhost:5433/postgres
           CI: 'true'
 
       - name: Upload Playwright artifacts on failure
