@@ -283,3 +283,116 @@ example when secrets exist but `MINICLOUD_MASTER_KEY` is not configured.
 Restart re-runs resolution so containers pick up changed configuration without
 a rebuild; the snapshot is refreshed to stay truthful about the running
 container. Historical deployments keep their original snapshot.
+
+### Persistent deployment queue (v0.7)
+
+Since v0.7 every deployment — manual deploy, rollback, git auto-deploy, PR
+preview — is executed by a persistent queue. The API only *enqueues*; a
+scheduler claims work and drives the existing pipeline.
+
+```mermaid
+graph TB
+    subgraph Producers
+        UI[Deploy button]
+        CLI[CLI / rollback]
+        PUSH[git push webhook]
+        PR[PR webhook<br/>opened/synchronize]
+    end
+    subgraph Queue[deployment_jobs in PostgreSQL]
+        Q1[queued · priority order]
+        Q2[claimed/running<br/>claim_token + heartbeat]
+        Q3[completed / failed / cancelled / superseded]
+    end
+    subgraph Engine[Deployment pipeline]
+        P[clone → cache → build → start → health → cutover]
+    end
+    UI --> Q1
+    CLI --> Q1
+    PUSH -->|"supersedes queued git jobs"| Q1
+    PR -->|"supersedes queued preview jobs"| Q1
+    SCHED[scheduler tick<br/>MAX_CONCURRENT_BUILDS] -->|claim| Q1
+    SCHED --> P
+    P --> Q3
+```
+
+Invariants:
+
+- **Deterministic ordering** — `(priority ASC, created_at ASC)`. Priorities:
+  manual 10 < rollback 15 < git auto-deploy 50 < preview 90.
+- **Global concurrency bound** — `MINICLOUD_MAX_CONCURRENT_BUILDS` (default 2)
+  simultaneous running jobs. Claiming uses `FOR UPDATE SKIP LOCKED`; two
+  schedulers cannot claim one job.
+- **Per-application serialization** — the claim query skips apps that already
+  have a running job, so stale revisions never race each other into traffic.
+- **Superseding** — enqueueing a git/preview job supersedes still-queued jobs
+  of the same trigger for that app (`SUPERSEDED` + `queue.superseded`
+  events). Manual jobs are never touched. A *running* deployment always
+  finishes, but its cutover remains guarded: if traffic moved on, it retires
+  itself instead of stealing it.
+- **Cancellation** — QUEUED cancels instantly. In-flight work unwinds via an
+  abort signal plumbed into `git clone`, the docker build stream and health
+  checks; candidate containers/networks are cleaned. RUNNING is refused:
+  stopping a live deployment is stop/rollback semantics, not cancellation.
+  Volumes and the active revision are never touched.
+
+#### Restart recovery
+
+On boot the order is fixed: reconcile (DB ↔ Docker truth) → queue recovery →
+scheduler starts. Recovery finalizes each orphaned `claimed/running` job from
+the deployment's reconciled truth:
+
+```text
+deployment QUEUED            → job back to queued (never started)
+deployment RUNNING           → job completed
+deployment FAILED            → job failed ("interrupted by restart")
+deployment STOPPED/CANCELLED → job cancelled
+```
+
+A queued deployment therefore survives any number of API restarts; a build
+interrupted mid-flight becomes FAILED exactly like a crash, and the next job
+proceeds.
+
+#### Build cache
+
+Before building, the engine computes a fingerprint per image:
+`sha256(commit_sha ‖ Dockerfile bytes ‖ sorted context content manifest)`
+(content-hashed, `.git` excluded, bounded). A matching row in
+`build_artifacts` whose image still exists locally means the build is skipped
+entirely (`build.image_reused`, `deployments.build_cache = 'image_reused'`);
+otherwise the build runs (Docker's own layer cache still applies) and the
+resulting tag is recorded. Multi-service apps fingerprint per service, so a
+one-service change rebuilds only that service's image. Rollback keeps its own
+direct image-reuse path, and prune treats artifact tags as referenced images.
+
+### Preview environments (v0.7)
+
+GitHub pull requests get isolated previews at
+`http://pr-<number>-<slug>.localhost:<gateway-port>`.
+
+```mermaid
+sequenceDiagram
+    participant GH as GitHub webhook
+    participant API as MiniCloud API
+    participant Q as Queue
+    participant D as Preview deployment
+    GH->>API: pull_request opened (#42)
+    API->>API: verify HMAC → match app → dedup delivery
+    API->>Q: enqueue preview job (priority 90)
+    Note over D: builds in minicloud-prev-* network,<br/>EPHEMERAL storage, no production secrets
+    Q->>D: run pipeline
+    D->>D: healthy → swap pr-42-slug route (guarded)
+    GH->>API: synchronize (new SHA)
+    API->>Q: newer preview job supersedes queued ones
+    D->>D: zero-downtime replace, same URL
+    GH->>API: closed
+    API->>D: remove route, containers, network
+```
+
+- One logical environment per `(application, PR number)` in
+  `preview_environments`; PR updates reuse it with new deployment history.
+- Previews never read or write `applications.active_deployment_id` — the
+  guarded swap targets the preview pointer, so production routing is untouchable.
+- Secrets policy: plain env vars are injected; encrypted secrets are NOT,
+  unless the application explicitly opts in. PR code is untrusted by default.
+- Webhooks validate HMAC first, deduplicate by `X-GitHub-Delivery`, scope to
+  the configured base branch, and derive route keys only from MiniCloud state.

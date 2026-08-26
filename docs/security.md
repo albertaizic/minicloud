@@ -174,3 +174,60 @@ network aliases and gateway labels only after strict validation.
 - Manifest snapshots are stored as non-secret deployment configuration;
   secrets remain in the encrypted app-level store and never enter snapshots,
   events or manifests.
+
+## Deployment queue, cancellation and build cache (v0.7)
+
+The queue is the only path to execution, so its security properties matter:
+
+- **Claim atomicity** — jobs are claimed with a guarded `UPDATE … WHERE id =
+  (SELECT … FOR UPDATE SKIP LOCKED)`. Two schedulers (or a restart racing a
+  tick) can never run one job twice; the claim token binds completion writes
+  to the worker that started the job.
+- **Stale claims cannot act** — after a restart, recovery derives terminal
+  job state from reconciled deployment truth; it never resumes work it did
+  not start. Heartbeats make foreign claims detectable.
+- **Cancellation races are decided in SQL** — the CANCELLED transition is
+  guarded on the current status, so exactly one side (pipeline failure or
+  canceller) wins; the loser's write no-ops. The cancel endpoint refuses
+  RUNNING deployments instead of masquerading as stop.
+- **Cache identity is content-based** — reuse requires an exact fingerprint
+  over commit SHA + Dockerfile bytes + full context manifest for the SAME
+  application and service. Cross-app confusion is unrepresentable (the app id
+  is part of the lookup key). Fingerprint metadata never contains secret
+  values; artifact rows store tags and hashes only.
+- **Prune keeps cached/rollback images** — artifact tags count as referenced,
+  so cache hits can never resurrect or delete another deployment's image.
+
+## Preview environments (v0.7)
+
+PR code is *untrusted by default*; previews are designed around that:
+
+- **No production secrets in previews** — preview containers resolve config
+  through the same resolver but with secrets excluded unless explicitly opted
+  in per application (`applications.secrets_in_previews`, default false).
+  Regression-tested: container env of a preview must not contain secret keys.
+- **No production volumes** — previews mount nothing; manifests' volumes are
+  ignored for preview deployments, so PR code can neither read nor corrupt
+  persistent data. Preview networks (`minicloud-prev-*`) are separate from
+  application networks.
+- **Route ownership** — preview route keys are `pr-<n>-<app-slug>`, derived
+  from MiniCloud state, never payload strings. The gateway serves only
+  registered routes; unknown/malformed hosts get 404/503. A preview cutover
+  swaps the preview pointer under a preview-scoped lock — production traffic
+  state is unreachable from preview logic.
+- **Webhook hardening** — HMAC-SHA256 verification happens before any payload
+  content is trusted; deliveries dedup on `X-GitHub-Delivery` (retries and
+  replays become no-ops); applications match by normalized repository URL;
+  base-branch scoping prevents arbitrary-branch triggers. Payload values can
+  never create applications, choose ids, or name routes.
+- **Scoped cleanup** — closing a preview tears down its own containers and
+  network only; production resources are addressed exclusively through
+  production state, which preview cleanup never touches.
+
+### Known limitations
+
+- Preview isolation is network + storage + secret scoped; PR builds still
+  execute Docker builds on the shared daemon. A hardened multi-tenant setup
+  would need gVisor/Kata-style sandboxing (out of scope for single-node v0.7).
+- The build cache trusts local image integrity; images are not re-verified by
+  digest after reuse.

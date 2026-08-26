@@ -60,6 +60,10 @@ solve, at an understandable scale.
 - **Runtime metrics**: live CPU %, memory used/limit, uptime and restart counts per deployment via Docker stats
 - **Multi-service applications (v0.5)**: declare `web`/`api`/`worker` services in `minicloud.yml` — private networking per app, persistent volumes, dependency ordering, per-service limits/restarts/logs/metrics
 - **Stable URLs + zero-downtime deploys (v0.4)**: every application gets `http://<app>.localhost:<gateway-port>`; replacements build and health-check in parallel, then traffic switches atomically — the old version keeps serving until the new one is verified
+- **Persistent deployment queue (v0.7)**: durable, restart-safe job store with deterministic priority ordering (manual → rollback → git push → preview), configurable concurrency (`MINICLOUD_MAX_CONCURRENT_BUILDS`), per-application serialization, and automatic superseding of obsolete queued auto-deploys
+- **Deployment cancellation (v0.7)**: cancel queued or in-flight work from API, CLI (`minicloud cancel`) or dashboard — candidate resources are cleaned up, the active revision never disturbed
+- **Build cache (v0.7)**: exact-image reuse keyed on commit + Dockerfile + context content; unchanged rebuilds skip clone/build entirely, per-service reuse for multi-service apps
+- **GitHub PR preview environments (v0.7)**: every pull request gets an isolated preview at `http://pr-<n>-<app>.localhost` with its own network and ephemeral storage — zero-downtime updates on new commits, full cleanup on close, production secrets and volumes excluded by default
 - **REST API + CLI + web dashboard**
 - **PostgreSQL persistence** with migrations
 

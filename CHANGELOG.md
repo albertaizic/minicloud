@@ -4,6 +4,36 @@ All notable changes to MiniCloud are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and the project adheres to [Semantic Versioning](https://semver.org).
 
+## [Unreleased] — v0.7 deployment execution layer: queue, cancellation, build cache, PR previews
+
+### Added
+
+- **Persistent deployment queue**: every deploy/rollback/auto-deploy/preview creates a durable `deployment_jobs` row (migration 007). Queue state survives API restarts; ordering is deterministic `(priority, created_at)`; per-application serialization means stale revisions of one app can never race into traffic
+- **Configurable concurrency**: `MINICLOUD_MAX_CONCURRENT_BUILDS` bounds simultaneous builds/deployments; queued jobs wait visibly; freeing a slot starts the next eligible job immediately
+- **Priority policy**: manual deploys (10) → rollbacks (15) → git auto-deploys (50) → previews (90); lower runs first. Persisted so restart behavior stays deterministic
+- **Superseding**: a newly enqueued git/preview job supersedes still-queued jobs of the same trigger for the same application (`SUPERSEDED`, with `superseded_by` + events). Manual jobs are never auto-superseded; running deployments finish but cannot steal traffic from newer revisions (guarded cutover)
+- **Cancellation**: `POST /api/deployments/:id/cancel`, `minicloud cancel`, dashboard button. QUEUED cancels instantly; CLONING/BUILDING unwinds the child git/docker work and cleans candidate containers; STARTING/HEALTH_CHECKING stops the candidate set; RUNNING is refused with stop/rollback guidance. Cancellation never touches volumes or the active revision
+- **Build cache**: exact-image reuse keyed by `sha256(commit + Dockerfile + context content manifest)` per app/service (`build_artifacts`). Unchanged rebuilds skip clone/build entirely (`build.image_reused`); real builds record `build.cache_miss`; Docker layer caching still accelerates misses. Prune keeps artifact images as rollback targets
+- **Restart recovery**: startup reconcile → queue recovery finalizes orphaned claims from reconciled deployment truth (requeue never-started work, finalize interrupted work), then the scheduler resumes. No duplicate cutovers, no zombie claims
+- **GitHub pull-request preview environments** (migrations 008): `pull_request opened/reopened/synchronize` deploy an isolated preview at `http://pr-<n>-<slug>.localhost:<gateway-port>`; `synchronize` replaces it zero-downtime at the same URL; `closed` removes route + containers + network. One logical preview per (app, PR)
+- **Preview isolation**: previews run in their own Docker network (`minicloud-prev-*`) with EPHEMERAL storage — production volumes are never mounted; production routing state is never consulted or modified
+- **Preview secret policy**: plain env vars flow into previews; encrypted secrets do NOT unless an explicit opt-in is enabled on the application. PR code is untrusted by default
+- **Webhook hardening**: delivery-id deduplication (`webhook_deliveries`) makes GitHub retries idempotent; signature verification precedes any payload trust; base-branch scoping; preview route keys derive only from the MiniCloud application slug + PR number
+- **Queue & preview observability**: `GET /api/queue` + `/api/apps/:id/queue` (deterministic positions), queue panel on overview/app pages with source chips (manual/git push/PR preview) and cancel actions, preview panel with PREVIEW badges distinct from PRODUCTION, build cache status on deployment detail, `queue.claimed/superseded`, `build.cache_hit/miss/image_reused`, `preview.*` events
+- **CLI**: `minicloud cancel`, `minicloud queue [app]`, `minicloud previews <app>`, `minicloud preview-delete <app> <PR#>`
+
+### Fixed
+
+- Git auto-deploy now records `last_deployed_sha` when a job completes, preventing repeated redeploys of an already-built SHA
+- E2E suite: database reset uses `DROP DATABASE … WITH (FORCE)` and wired global setup/teardown; app fixtures are find-or-create; ambiguous/duplicated-name selectors replaced with deterministic ones; limits form no longer swallows invalid input behind native browser validation
+
+### Security
+
+- Preview environments default to NO production secrets and NO production volumes
+- Preview cleanup is scoped by preview environment identity — closing a PR cannot touch production resources
+- Webhook replay protection via delivery GUID dedup; HMAC validation unchanged and always first
+
+
 
 ## [Unreleased] — v0.5 multi-service, private networking, volumes
 

@@ -350,3 +350,41 @@ minicloud volumes <app>
 minicloud logs <deployment> --service api
 minicloud stats <deployment> --service worker
 ```
+
+### Deployment queue (v0.7)
+
+```
+GET  /api/queue                  # global snapshot: { limit, running[], queued[] }
+GET  /api/apps/:id/queue         # same, scoped to one application
+POST /api/deployments/:id/cancel # cancel queued/in-flight work (409 for RUNNING)
+```
+
+Queue entries carry `status` (`queued|claimed|running|completed|failed|
+cancelled|superseded`), `trigger` (`manual|git|preview`), `priority`
+(manual 10 < rollback 15 < git 50 < preview 90) and — for queued jobs — a
+deterministic `position`. Concurrency is configured with
+`MINICLOUD_MAX_CONCURRENT_BUILDS`.
+
+Deployment responses gain `buildCache` (`miss | partial | image_reused`) and
+`previewEnvironmentId`. New events: `queue.claimed`, `queue.superseded`,
+`cancellation.requested`, `deployment.cancelled`, `build.cache_miss`,
+`build.image_reused`, `preview.*`.
+
+### Preview environments (v0.7)
+
+Driven by GitHub webhooks (`pull_request` opened / reopened / synchronize /
+closed) on the existing `POST /api/webhook` endpoint. Manual endpoints:
+
+```
+GET    /api/apps/:id/previews        # list (prNumber, headSha, status, url, …)
+DELETE /api/apps/:id/previews/:pr    # close + cleanup (same semantics as PR close)
+```
+
+### CLI
+
+```
+minicloud cancel <deployment>
+minicloud queue [app]
+minicloud previews <app>
+minicloud preview-delete <app> <pr-number>
+```
