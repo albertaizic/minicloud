@@ -62,6 +62,9 @@ describe('persistent deployment queue (real docker)', () => {
 
   it('manual deploys run through the queue to RUNNING with a completed job', async () => {
     const q = queueOf(ctx.app);
+    // Harness auto-starts the scheduler (production parity); this test needs
+    // to observe the QUEUED phase, so stop claiming first.
+    q.stop();
     const appId = await createApp(ctx, `q-basic-${Date.now() % 100000}`, fixtures.url('hello-node'));
     const { deploymentId, jobId } = await q.createAndEnqueue(appId, { trigger: 'manual', desiredRef: 'HEAD' });
     // Scheduler is not started yet in tests; drive one claim explicitly.
@@ -201,7 +204,8 @@ describe('queue restart recovery (real docker)', () => {
   it('queued jobs survive an API restart; orphaned claims finalize from truth', async () => {
     const fixtures = await startFixtureServer(['hello-node']);
     const name = `q-restart-${Date.now() % 100000}`;
-    let ctx = await createTestApp();
+    // autostartQueue=false: the scenario is "process died before any work ran".
+    let ctx = await createTestApp({ autostartQueue: false });
     const q1 = queueOf(ctx.app);
     const appId = await createApp(ctx, name, fixtures.url('hello-node'));
     const first = await q1.createAndEnqueue(appId, { trigger: 'manual', desiredRef: 'HEAD' });
@@ -210,7 +214,7 @@ describe('queue restart recovery (real docker)', () => {
     await closeTestContext(ctx);
 
     // New process over the same database: reconcile -> recover -> schedule.
-    ctx = await createTestApp({ reuseDbName: ctx.dbName });
+    ctx = await createTestApp({ reuseDbName: ctx.dbName, autostartQueue: false });
     const q2 = queueOf(ctx.app);
     const recovered = await q2.recoverAfterRestart();
     expect(recovered.finalized).toBe(0);

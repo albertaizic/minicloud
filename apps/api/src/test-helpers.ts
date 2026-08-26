@@ -30,7 +30,7 @@ export interface TestContext {
 process.env.CRASH_MONITOR_INTERVAL_MS = String(60 * 60 * 1000);
 
 export async function createTestApp(
-  opts: { withMasterKey?: boolean; reuseDbName?: string } = {},
+  opts: { withMasterKey?: boolean; reuseDbName?: string; autostartQueue?: boolean } = {},
 ): Promise<TestContext> {
   // Deterministic behavior even if the operator shell exports a real key.
   delete process.env.MINICLOUD_MASTER_KEY;
@@ -72,6 +72,12 @@ export async function createTestApp(
     gatewayPort: engineConfig.gatewayPort,
     ...(opts.withMasterKey === false ? {} : { masterKey: TEST_MASTER_KEY }),
   });
+  // Mirror production wiring: the scheduler runs unless a test explicitly
+  // needs deterministic enqueue-without-claim semantics.
+  if (opts.autostartQueue !== false) {
+    const q = (app as FastifyInstance & { minicloudQueue?: import('@minicloud/deployment-engine').DeploymentQueue }).minicloudQueue;
+    q?.start();
+  }
   await app.ready();
   return { app, db, dbName, engine, docker, gatewayPort: engineConfig.gatewayPort };
 }
