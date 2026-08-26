@@ -131,30 +131,39 @@ test.describe.serial('multi-service + zero-downtime UI (real stack)', () => {
     // Rollback creates a NEW deployment referencing A (history is immutable);
     // wait for THAT deployment to win the pointer.
     let rolledBack = false;
+    let version = '';
     for (let i = 0; i < 240; i++) {
       const appRow = (await apiGet(`/api/apps/${appId}`)) as { activeDeploymentId?: string; deployments: Array<{ id: string; status: string; isActive: boolean; rollbackOf: string | null }> };
       const act = appRow.activeDeploymentId ?? '';
       const actRow = appRow.deployments.find((d) => d.id === act);
-      if (act && act !== depB && actRow?.rollbackOf === depA) { rolledBack = true; break; }
-      await new Promise((r) => setTimeout(r, 500));
-    }
-    expect(rolledBack).toBe(true);
-    // Version back to A; the volume counter NOT reset. During the predecessor
-    // drain the stable URL may answer from either revision for a moment —
-    // poll until it settles on A.
-    let version = '';
-    for (let i = 0; i < 60; i++) {
-      const home = await appUrl('e2e-msvc');
-      if (home.status === 200) {
-        version = JSON.parse(home.body).version;
-        if (version === 'msvc-A') break;
+      if (act && act !== depB && actRow?.rollbackOf === depA) {
+        rolledBack = true;
+        const home = await appUrl('e2e-msvc');
+        if (home.status === 200) {
+          version = JSON.parse(home.body).version;
+          if (version === 'msvc-A') break;
+        }
       }
       await new Promise((r) => setTimeout(r, 500));
     }
-    expect(version).toBe('msvc-A');
 
-    // The volume counter survived the rollback (api still reports its
-    // pre-rollback count through the stable URL).
+    // TEMP-PROBE: persist whole-app truth for post-mortem.
+    try {
+      const fsx = await import('node:fs/promises');
+      const finalState = (await apiGet(`/api/apps/${appId}`)) as { activeDeploymentId?: string; deployments: Array<{ id: string; status: string; rollbackOf: string | null }> };
+      const routes = await apiGet('/api/routes');
+      const containers = await ctx.docker.listManagedContainers();
+      await fsx.writeFile('probe-vol.json', JSON.stringify({
+        rolledBack, version, active: finalState.activeDeploymentId,
+        deps: finalState.deployments.map((d) => ({ id: d.id.slice(0, 8), status: d.status, rb: (d.rollbackOf ?? '').slice(0, 8) || null })),
+        containers: containers.map((c) => ({ id: c.id.slice(0, 8), state: c.state, dep: (c.labels['minicloud.deployment'] ?? '').slice(0, 8), svc: c.labels['minicloud.service'] ?? null })),
+        routes: routes.routes.map((r: { slug: string; deploymentId: string }) => ({ slug: r.slug, dep: r.deploymentId.slice(0, 8) })),
+      }, null, 2));
+    } catch { /* diagnostics only */ }
+
+    expect(rolledBack).toBe(true);
+
+    // Version back to A; the volume counter NOT reset.
     const volHome = await appUrl('e2e-msvc');
     const parsedVol = JSON.parse(volHome.body) as { version: string; api: { count: number } };
     expect(parsedVol.version).toBe('msvc-A');
