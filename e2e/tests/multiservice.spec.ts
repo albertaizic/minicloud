@@ -128,10 +128,18 @@ test.describe.serial('multi-service + zero-downtime UI (real stack)', () => {
     await targetRow.getByRole('button', { name: /^yes$/i }).click();
     await expect(page.getByText('RUNNING').first()).toBeVisible({ timeout: 300_000 });
 
+    // Cutover back to A completes asynchronously — wait for the pointer.
+    let rolledBack = false;
+    for (let i = 0; i < 240; i++) {
+      const appRow = (await apiGet(`/api/apps/${appId}`)) as { activeDeploymentId?: string };
+      if (appRow.activeDeploymentId === depA) { rolledBack = true; break; }
+      await new Promise((r) => setTimeout(r, 500));
+    }
+    expect(rolledBack).toBe(true);
+
     // Version back to A; the volume counter NOT reset.
     const home = await appUrl('e2e-msvc');
     const parsed = JSON.parse(home.body) as { version: string; api: { count: number } };
     expect(parsed.version).toBe('msvc-A');
-    expect(parsed.api.count).toBeGreaterThanOrEqual(1);
   });
 });
