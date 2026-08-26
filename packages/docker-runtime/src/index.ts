@@ -157,7 +157,10 @@ export class DockerRuntime {
       // authoritative completion signal — poll for it and resolve early.
       poll = setInterval(() => {
         this.docker.getImage(opts.tag).inspect()
-          .then((info: { Id: string }) => settle(() => resolve({ imageId: info.Id })))
+          .then((info) => {
+            const id: string = info.Id;
+            settle(() => resolve({ imageId: id }));
+          })
           .catch(() => { /* not built yet */ });
       }, 500);
       const onAbort = () => {
