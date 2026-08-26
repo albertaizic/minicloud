@@ -11,7 +11,6 @@ const VITE = path.join(ROOT, 'node_modules', 'vite', 'bin', 'vite.js');
 
 export default defineConfig({
   testDir: './tests',
-  globalSetup: './helpers/global-setup.mjs',
   globalTeardown: './helpers/global-teardown.mjs',
   timeout: 600_000,
   expect: { timeout: 15_000 },
@@ -35,7 +34,16 @@ export default defineConfig({
       env: { PORT: '4555' },
     },
     {
-      command: `node "${TSX}" apps/api/src/main.ts`,
+      // Deterministic database bootstrap BEFORE the API opens its port:
+      // terminate stragglers, force-drop (PG13+), recreate, then boot.
+      // Migrations themselves run inside main.ts with THIS env, so the
+      // schema always lands in minicloud_e2e — never in the dev database
+      // a stale shell variable or .env might name.
+      command:
+        `docker exec minicloud-postgres psql -U minicloud -c "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname='minicloud_e2e' AND pid <> pg_backend_pid()" && ` +
+        `docker exec minicloud-postgres psql -U minicloud -c "DROP DATABASE IF EXISTS minicloud_e2e WITH (FORCE)" && ` +
+        `docker exec minicloud-postgres psql -U minicloud -c "CREATE DATABASE minicloud_e2e" && ` +
+        `node "${TSX}" apps/api/src/main.ts`,
       port: API_PORT,
       reuseExistingServer: false,
       cwd: ROOT,
