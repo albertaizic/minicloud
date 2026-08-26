@@ -152,15 +152,10 @@ test.describe.serial('queue & preview UI (v0.7)', () => {
       return { status: res.status, body: (await res.json()) as Record<string, unknown> };
     }
 
-
-    // Fetch head SHAs of the two revisions via ls-remote equivalent: the API's
-    // sync endpoint needs a deployed sha; instead read them from the fixture
-    // server advertisement directly.
-    const refsRes = await fetch('http://localhost:4555/rev.git/info/refs');
-    const refs = await refsRes.text();
-    const shaLines = refs.trim().split('\n').filter((l) => l.includes('refs/heads/main'));
-    const rev0 = shaLines[0]?.split('\t')[0] ?? '';
-    const rev1 = shaLines[1]?.split('\t')[0] ?? '';
+    // Revision SHAs come from the fixture's machine-readable index.
+    const shas = (await (await fetch('http://localhost:4555/shas.json')).json()) as Record<string, string[]>;
+    const rev0 = shas.rev[0] ?? '';
+    const rev1 = shas.rev[1] ?? '';
     expect(rev0).toMatch(/^[0-9a-f]{40}$/);
     expect(rev1).toMatch(/^[0-9a-f]{40}$/);
 

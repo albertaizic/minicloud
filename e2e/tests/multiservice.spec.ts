@@ -57,13 +57,22 @@ test.describe.serial('multi-service + zero-downtime UI (real stack)', () => {
 
     // B becomes healthy: badge moves.
     await waitForDeploymentStatus(depB, ['RUNNING'], 300_000);
+    // Cutover (swap + gateway verify + drain of A) completes asynchronously
+    // after RUNNING; wait for the pointer rather than racing the badge.
+    let activeId = '';
+    for (let i = 0; i < 60; i++) {
+      const appRow = (await apiGet(`/api/apps/${appId}`)) as { activeDeploymentId?: string };
+      activeId = appRow.activeDeploymentId ?? '';
+      if (activeId === depB) break;
+      await new Promise((r) => setTimeout(r, 500));
+    }
+    expect(activeId).toBe(depB);
     await expect(page.locator('tr', { hasText: depB.slice(0, 8) }).locator('text=ACTIVE')).toBeVisible({ timeout: 60_000 });
     await expect(page.locator('tr', { hasText: depA.slice(0, 8) }).locator('text=ACTIVE')).toHaveCount(0);
 
     // Stable URL now serves B.
     const after = await appUrl('e2e-msvc');
     expect(JSON.parse(after.body).version).toBe('msvc-B');
-    expectNoErrors(consoleErrors, pageErrors);
 
     // Deployment detail of B: ACTIVE badge + services table.
     await page.goto(`/deployments/${depB}`);

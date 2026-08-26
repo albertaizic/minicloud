@@ -62,8 +62,25 @@ for (const spec of specs) {
   git(['update-server-info'], bare);
 }
 
+// Machine-readable revision index so tests can address every revision without
+// parsing the git wire protocol (info/refs only advertises the tip).
+const shas = {};
+for (const spec of specs) {
+  const count = spec.revisions ? spec.revisions.length : 1;
+  const out = execFileSync(
+    'git',
+    ['log', '--format=%H', `-n${count}`, '--reverse', 'main'],
+    { cwd: path.join(root, `work-${spec.name}`) },
+  );
+  shas[spec.name] = out.toString().trim().split('\n').filter(Boolean);
+}
+
 const server = http.createServer((req, res) => {
   const urlPath = decodeURIComponent((req.url ?? '/').split('?')[0]);
+  if (urlPath === '/shas.json') {
+    res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify(shas));
+    return;
+  }
   const filePath = path.join(root, urlPath);
   if (!filePath.startsWith(root)) {
     res.writeHead(403).end();

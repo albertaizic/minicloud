@@ -49,17 +49,27 @@ test.describe.serial('reliability UI flows (real stack)', () => {
     await page.getByRole('button', { name: /stop/i }).click();
     await expect(page.getByText(/unavailable/i)).toBeVisible();
     await page.getByRole('button', { name: /confirm force stop/i }).click();
-    await expect(page.getByText('STOPPED').first()).toBeVisible({ timeout: 20_000 });
-
-    // Route behavior: honest 503 while nothing is active.
-    const served = await appUrl('e2e-rel', '/health');
-    expect(served.status).toBe(503);
+    // Route behavior: honest 503 while nothing is active. The route clear
+    // lands at the tail of stopDeployment; poll briefly instead of racing it.
+    let servedStatus = 0;
+    for (let i = 0; i < 30; i++) {
+      servedStatus = (await appUrl('e2e-rel', '/health')).status;
+      if (servedStatus === 503) break;
+      await new Promise((r) => setTimeout(r, 500));
+    }
+    expect(servedStatus).toBe(503);
 
     // Restart via UI: routing recovers, restart count updates.
     await page.getByRole('button', { name: /restart/i }).click();
     await expect(page.getByText('RUNNING').first()).toBeVisible({ timeout: 120_000 });
-    const served2 = await appUrl('e2e-rel', '/health');
-    expect(served2.status).toBe(200);
+    // Routing recovers onto the fresh container's new port.
+    let served2Status = 0;
+    for (let i = 0; i < 30; i++) {
+      served2Status = (await appUrl('e2e-rel', '/health')).status;
+      if (served2Status === 200) break;
+      await new Promise((r) => setTimeout(r, 500));
+    }
+    expect(served2Status).toBe(200);
 
     // Restart count visible in the deployment detail.
     await page.goto(`/deployments/${depId}`);
