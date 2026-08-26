@@ -68,6 +68,13 @@ test.describe.serial('multi-service + zero-downtime UI (real stack)', () => {
     }
     expect(activeId).toBe(depB);
     await expect(page.locator('tr', { hasText: depB.slice(0, 8) }).locator('text=ACTIVE')).toBeVisible({ timeout: 60_000 });
+    // A's retirement rides the same asynchronous tail; confirm via API.
+    for (let i = 0; i < 30; i++) {
+      const appRow = (await apiGet(`/api/apps/${appId}`)) as { deployments: Array<{ id: string; isActive: boolean }> };
+      const aRow = appRow.deployments.find((d) => d.id === depA);
+      if (aRow && aRow.isActive === false) break;
+      await new Promise((r) => setTimeout(r, 500));
+    }
     await expect(page.locator('tr', { hasText: depA.slice(0, 8) }).locator('text=ACTIVE')).toHaveCount(0);
 
     // Stable URL now serves B.
