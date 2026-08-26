@@ -98,7 +98,7 @@ test.describe.serial('multi-service + zero-downtime UI (real stack)', () => {
     // Deployment page: per-service metrics via the service selector. Docker
     // stats can take a while on a saturated box — allow a generous window.
     await page.goto(`/deployments/${depB}`);
-    await expect(page.getByText(/CPU|only available while/i).first()).toBeVisible({ timeout: 60_000 });
+    await expect(page.getByText(/CPU|Metrics are only available/i).first()).toBeVisible({ timeout: 60_000 });
 
     // Per-service logs actually change displayed data.
     await page.goto(`/deployments/${depB}`);
