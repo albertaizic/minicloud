@@ -52,7 +52,8 @@ export default defineConfig({
       env: {
         PORT: String(API_PORT),
         HOST: '0.0.0.0',
-        DATABASE_URL: 'postgres://minicloud:minicloud@localhost:5433/minicloud_e2e',
+        PORT_RANGE_END: String(34999),
+        MINICLOUD_MAX_CONCURRENT_BUILDS: '1',
         MINICLOUD_MASTER_KEY: 'e2e-master-key-0123456789abcdef',
         GATEWAY_PORT: String(GW_PORT),
         WORKSPACE_DIR: path.join(ROOT, '.minicloud', 'e2e-workspace'),
