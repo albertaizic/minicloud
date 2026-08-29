@@ -2,6 +2,7 @@ import { execFileSync } from 'node:child_process';
 
 export default async function globalTeardown() {
   try {
+    // Clean up any MiniCloud-managed containers
     const out = execFileSync(
       'docker',
       ['ps', '-aq', '--filter', 'label=minicloud.managed=true'],
@@ -14,6 +15,7 @@ export default async function globalTeardown() {
     for (const n of nets.split('\n').filter(Boolean)) {
       try { execFileSync('docker', ['network', 'rm', n], { stdio: 'pipe', timeout: 15_000 }); } catch { /* gone */ }
     }
+    // Clean up the test database
     execFileSync(
       'docker',
       ['exec', 'minicloud-postgres', 'psql', '-U', 'minicloud', '-c', 'DROP DATABASE IF EXISTS minicloud_e2e WITH (FORCE)'],

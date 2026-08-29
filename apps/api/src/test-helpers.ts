@@ -27,7 +27,8 @@ export interface TestContext {
 
 // Deterministic engine tests drive engine.checkCrashes()/reconcile()
 // explicitly; a live 5s background monitor would race them (CI Linux flake).
-process.env.CRASH_MONITOR_INTERVAL_MS = String(60 * 60 * 1000);
+// Use a short interval (2s) so tests can observe crash->recovery within reasonable time.
+process.env.CRASH_MONITOR_INTERVAL_MS = String(2000);
 
 export async function createTestApp(
   opts: { withMasterKey?: boolean; reuseDbName?: string; autostartQueue?: boolean } = {},

@@ -18,6 +18,16 @@ export default async function globalSetup() {
     execFileSync('docker', ['exec', 'minicloud-postgres', 'pg_isready', '-U', 'minicloud'], { stdio: 'pipe', timeout: 60_000 });
   }
 
+  // Ensure the E2E database exists
+  try {
+    execFileSync('docker', ['exec', 'minicloud-postgres', 'psql', '-U', 'minicloud', '-c', 'DROP DATABASE IF EXISTS minicloud_e2e WITH (FORCE)'], { stdio: 'pipe' });
+    execFileSync('docker', ['exec', 'minicloud-postgres', 'psql', '-U', 'minicloud', '-c', 'CREATE DATABASE minicloud_e2e'], { stdio: 'pipe' });
+    console.log('[e2e-setup] database minicloud_e2e ready');
+  } catch (e) {
+    console.error('[e2e-setup] database setup failed:', String(e));
+    throw e;
+  }
+
   for (const image of IMAGES) {
     try {
       execFileSync('docker', ['image', 'inspect', image], { stdio: 'pipe' });

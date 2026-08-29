@@ -45,22 +45,24 @@ export default defineConfig({
         `docker exec minicloud-postgres psql -U minicloud -c "DROP DATABASE IF EXISTS minicloud_e2e WITH (FORCE)" && ` +
         `docker exec minicloud-postgres psql -U minicloud -c "CREATE DATABASE minicloud_e2e" && ` +
         `node "${TSX}" apps/api/src/main.ts`,
-      port: API_PORT,
+      port: 4100,
       reuseExistingServer: false,
       cwd: ROOT,
       timeout: 60_000,
       env: {
-        PORT: String(API_PORT),
+        PORT: String(4100),
         HOST: '0.0.0.0',
         PORT_RANGE_END: String(34999),
         MINICLOUD_MAX_CONCURRENT_BUILDS: '1',
         MINICLOUD_MASTER_KEY: 'e2e-master-key-0123456789abcdef',
-        GATEWAY_PORT: String(GW_PORT),
+        GATEWAY_PORT: String(8080),
         WORKSPACE_DIR: path.join(ROOT, '.minicloud', 'e2e-workspace'),
         PORT_RANGE_START: '34000',
         PORT_RANGE_END: '34999',
         LOG_LEVEL: 'warn',
         CRASH_MONITOR_INTERVAL_MS: '3000',
+        // CRITICAL: Point the API at the E2E database, not the dev database
+        DATABASE_URL: 'postgres://minicloud:minicloud@localhost:5433/minicloud_e2e',
       },
     },
     {
