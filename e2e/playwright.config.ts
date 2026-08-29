@@ -40,7 +40,7 @@ export default defineConfig({
       port: 4100,
       reuseExistingServer: false,
       cwd: ROOT,
-      timeout: 60_000,
+      timeout: 120_000,
       env: {
         PORT: String(4100),
         HOST: '0.0.0.0',
