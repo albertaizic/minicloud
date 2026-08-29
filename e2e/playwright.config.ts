@@ -2,7 +2,7 @@ import path from 'node:path';
 import { defineConfig } from '@playwright/test';
 
 const API_PORT = 4100;
-const GW_PORT = 8080;
+const GW_PORT = 8081;
 const DASH_PORT = 5173;
 // Config lives in <root>/e2e/; repo root is one level up.
 const ROOT = path.resolve(import.meta.dirname ?? '.', '..');
@@ -47,7 +47,7 @@ export default defineConfig({
         PORT_RANGE_END: String(34999),
         MINICLOUD_MAX_CONCURRENT_BUILDS: '1',
         MINICLOUD_MASTER_KEY: 'e2e-master-key-0123456789abcdef',
-        GATEWAY_PORT: String(8080),
+        GATEWAY_PORT: String(8081),
         WORKSPACE_DIR: path.join(ROOT, '.minicloud', 'e2e-workspace'),
         PORT_RANGE_START: '34000',
         PORT_RANGE_END: '34999',
@@ -56,14 +56,3 @@ export default defineConfig({
         // CRITICAL: Point the API at the E2E database, not the dev database
         DATABASE_URL: 'postgres://minicloud:minicloud@localhost:5433/minicloud_e2e',
       },
-    },
-    {
-      command: `node "${VITE}" --port ${DASH_PORT} --strictPort`,
-      port: DASH_PORT,
-      reuseExistingServer: false,
-      cwd: path.join(ROOT, 'apps', 'dashboard'),
-      timeout: 60_000,
-      env: { MINICLOUD_API_URL: `http://localhost:${API_PORT}` },
-    },
-  ],
-});
