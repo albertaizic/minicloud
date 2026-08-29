@@ -40,11 +40,16 @@ export default defineConfig({
       // Migrations themselves run inside main.ts with THIS env, so the
       // schema always lands in minicloud_e2e — never in the dev database
       // a stale shell variable or .env might name.
-      command:
-        `docker exec minicloud-postgres psql -U minicloud -c "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname='minicloud_e2e' AND pid <> pg_backend_pid()" && ` +
-        `docker exec minicloud-postgres psql -U minicloud -c "DROP DATABASE IF EXISTS minicloud_e2e WITH (FORCE)" && ` +
-        `docker exec minicloud-postgres psql -U minicloud -c "CREATE DATABASE minicloud_e2e" && ` +
-        `node "${TSX}" apps/api/src/main.ts`,
+      command: (() => {
+        const isCI = process.env.CI === 'true';
+        const psqlBase = isCI
+          ? `psql -h localhost -p 5433 -U minicloud`
+          : `docker exec minicloud-postgres psql -U minicloud`;
+        return `${psqlBase} -c "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname='minicloud_e2e' AND pid <> pg_backend_pid()" && ` +
+          `${psqlBase} -c "DROP DATABASE IF EXISTS minicloud_e2e WITH (FORCE)" && ` +
+          `${psqlBase} -c "CREATE DATABASE minicloud_e2e" && ` +
+          `node "${TSX}" apps/api/src/main.ts`;
+      })(),
       port: 4100,
       reuseExistingServer: false,
       cwd: ROOT,
