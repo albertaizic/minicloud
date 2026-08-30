@@ -39,7 +39,12 @@ export default defineConfig({
       port: 4100,
       reuseExistingServer: false,
       cwd: ROOT,
-      timeout: 180_000,
+      timeout: 300_000,
+      healthCheck: {
+        url: `http://localhost:4100/api/health`,
+        interval: 5_000,
+        maxRetries: 30,
+      },
       env: {
         PORT: String(4100),
         HOST: '0.0.0.0',
@@ -61,8 +66,11 @@ export default defineConfig({
       port: DASH_PORT,
       reuseExistingServer: false,
       cwd: path.join(ROOT, 'apps', 'dashboard'),
-      timeout: 60_000,
+      timeout: 120_000,
+      healthCheck: {
+        url: `http://localhost:${DASH_PORT}`,
+        interval: 5_000,
+        maxRetries: 20,
+      },
       env: { MINICLOUD_API_URL: `http://localhost:${API_PORT}` },
     },
-  ],
-});
