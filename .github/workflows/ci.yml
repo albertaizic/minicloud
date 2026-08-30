@@ -106,6 +106,9 @@ jobs:
       # Bootstrap E2E test database before Playwright starts webServer
       - name: Bootstrap E2E database
         run: npm run pretest:e2e
+      - name: Verify E2E database exists
+        run: |
+          PGPASSWORD=minicloud psql -h localhost -p 5433 -U minicloud -d postgres -c "SELECT datname FROM pg_database WHERE datname = 'minicloud_e2e';"
       - name: Run Playwright suite
         run: |
           npx playwright test --config=e2e/playwright.config.ts --reporter=line,json
