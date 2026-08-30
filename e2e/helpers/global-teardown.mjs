@@ -1,9 +1,8 @@
 import { execFileSync } from 'node:child_process';
+import { dropE2eDatabase } from './postgres.mjs';
 
 export default async function globalTeardown() {
-  const isCI = process.env.CI === 'true';
   try {
-    // Clean up any MiniCloud-managed containers
     const out = execFileSync(
       'docker',
       ['ps', '-aq', '--filter', 'label=minicloud.managed=true'],
@@ -12,17 +11,21 @@ export default async function globalTeardown() {
     for (const id of out.split('\n').filter(Boolean)) {
       try { execFileSync('docker', ['rm', '-f', id], { stdio: 'pipe', timeout: 15_000 }); } catch { /* gone */ }
     }
-    const nets = execFileSync('docker', ['network', 'ls', '--filter', 'name=minicloud-app-', '--format', '{{.Name}}'], { encoding: 'utf8', timeout: 15_000 });
-    for (const n of nets.split('\n').filter(Boolean)) {
-      try { execFileSync('docker', ['network', 'rm', n], { stdio: 'pipe', timeout: 15_000 }); } catch { /* gone */ }
+    const nets = execFileSync(
+      'docker',
+      ['network', 'ls', '--filter', 'name=minicloud-app-', '--format', '{{.Name}}'],
+      { encoding: 'utf8', timeout: 15_000 },
+    );
+    for (const name of nets.split('\n').filter(Boolean)) {
+      try { execFileSync('docker', ['network', 'rm', name], { stdio: 'pipe', timeout: 15_000 }); } catch { /* in use or gone */ }
     }
-    // Clean up the test database
-    if (isCI) {
-      execFileSync('psql', ['-h', 'localhost', '-p', '5433', '-U', 'minicloud', '-c', 'DROP DATABASE IF EXISTS minicloud_e2e WITH (FORCE)'], { stdio: 'pipe', timeout: 15_000 });
-    } else {
-      execFileSync('docker', ['exec', 'minicloud-postgres', 'psql', '-U', 'minicloud', '-c', 'DROP DATABASE IF EXISTS minicloud_e2e WITH (FORCE)'], { stdio: 'pipe', timeout: 15_000 });
-    }
-  } catch (e) {
-    console.warn('[e2e-teardown] cleanup incomplete:', String(e).slice(0, 200));
+  } catch (error) {
+    console.warn('[e2e-teardown] Docker cleanup incomplete:', String(error).slice(0, 200));
+  }
+
+  try {
+    await dropE2eDatabase();
+  } catch (error) {
+    console.warn('[e2e-teardown] database cleanup incomplete:', String(error).slice(0, 200));
   }
 }

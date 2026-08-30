@@ -56,3 +56,14 @@ export default defineConfig({
         // CRITICAL: Point the API at the E2E database, not the dev database
         DATABASE_URL: 'postgres://minicloud:minicloud@localhost:5433/minicloud_e2e',
       },
+    },
+    {
+      command: `node "${VITE}" --port ${DASH_PORT} --strictPort`,
+      port: DASH_PORT,
+      reuseExistingServer: false,
+      cwd: path.join(ROOT, 'apps', 'dashboard'),
+      timeout: 60_000,
+      env: { MINICLOUD_API_URL: `http://localhost:${API_PORT}` },
+    },
+  ],
+});

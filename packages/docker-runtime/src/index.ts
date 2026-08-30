@@ -448,9 +448,9 @@ export class DockerRuntime {
   }
 
   /** Remove an image by tag. Returns false when it does not exist. */
-  async removeImage(tag: string): Promise<boolean> {
+  async removeImage(tag: string, options: { force?: boolean } = {}): Promise<boolean> {
     try {
-      await this.docker.getImage(tag).remove();
+      await this.docker.getImage(tag).remove({ force: options.force ?? false });
       return true;
     } catch (err) {
       const status = (err as { statusCode?: number }).statusCode;

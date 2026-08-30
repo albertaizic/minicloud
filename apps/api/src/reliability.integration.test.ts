@@ -189,7 +189,7 @@ describe('rollback (real docker)', () => {
     const aRow = (await ctx.app.inject({ method: 'GET', url: `/api/deployments/${depA}` })).json();
 
     // Destroy the image to force the rebuild path.
-    const removed = await ctx.docker.removeImage(aRow.imageTag as string);
+    const removed = await ctx.docker.removeImage(aRow.imageTag as string, { force: true });
     expect(removed).toBe(true);
 
     const res = await ctx.app.inject({
