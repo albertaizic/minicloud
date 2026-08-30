@@ -2,7 +2,7 @@ import { expect, type Page } from '@playwright/test';
 import http from 'node:http';
 
 export const API = 'http://localhost:4100';
-export const GW_PORT = 8080;
+export const GW_PORT = 8081;
 
 export function appUrl(slug: string, path = '/'): Promise<{ status: number; body: string }> {
   return new Promise((resolve) => {

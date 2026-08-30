@@ -28,7 +28,7 @@ export default defineConfig({
   outputDir: path.join(ROOT, 'e2e-artifacts', 'results'),
   webServer: [
     {
-      command: `node "${TSX}" e2e/helpers/fixture-server.mjs`,
+      command: `node "${TSX}" "${path.join(ROOT, 'e2e', 'helpers', 'fixture-server.mjs')}"`,
       port: 4555,
       reuseExistingServer: false,
       cwd: ROOT,
@@ -36,19 +36,18 @@ export default defineConfig({
     },
     {
       // The API server. Global setup already bootstraps the database.
-      command: `node "${TSX}" apps/api/src/main.ts`,
+      command: `node "${TSX}" "${path.join(ROOT, 'apps', 'api', 'src', 'main.ts')}"`,
       port: 4100,
       reuseExistingServer: false,
-      cwd: ROOT,
       timeout: 300_000,
       healthCheck: {
-        url: `http://localhost:4100/api/health`,
+        url: `http://127.0.0.1:4100/api/health`,
         interval: 5_000,
         maxRetries: 30,
       },
       env: {
         PORT: String(4100),
-        HOST: '0.0.0.0',
+        HOST: '127.0.0.1',
         PORT_RANGE_END: String(34999),
         MINICLOUD_MAX_CONCURRENT_BUILDS: '1',
         MINICLOUD_MASTER_KEY: 'e2e-master-key-0123456789abcdef',
@@ -73,7 +72,7 @@ export default defineConfig({
         interval: 5_000,
         maxRetries: 20,
       },
-      env: { MINICLOUD_API_URL: `http://localhost:${API_PORT}` },
+      env: { MINICLOUD_API_URL: `http://127.0.0.1:${API_PORT}` },
     },
   ],
 });

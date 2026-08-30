@@ -73,7 +73,7 @@ test.describe('clean-user journey (real stack)', () => {
     }>;
     const app = apps.find((a) => a.name === appSlug)!;
     appId = app.id;
-    expect(app.url).toBe(`http://${appSlug}.localhost:8080`);
+    expect(app.url).toBe(`http://${appSlug}.localhost:8081`);
     expect(app.activeDeploymentId).toBeTruthy();
     const dep = (await apiGet(`/api/deployments/${app.activeDeploymentId}`)) as {
       isActive: boolean; commitSha: string | null;
@@ -88,7 +88,7 @@ test.describe('clean-user journey (real stack)', () => {
 
     // Back on the app page: stable URL + active deployment visible without reload.
     await page.goto(`/apps/${appId}`);
-    await expect(page.getByText(`http://${appSlug}.localhost:8080`)).toBeVisible();
+    await expect(page.getByText(`http://${appSlug}.localhost:8081`)).toBeVisible();
   });
 
   test('application page shows the full operational picture', async ({ page }) => {

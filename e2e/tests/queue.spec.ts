@@ -177,7 +177,7 @@ test.describe.serial('queue & preview UI (v0.7)', () => {
       if (d.status === 'RUNNING') break;
       await new Promise((r) => setTimeout(r, 1000));
     }
-    const servedA = await requestThroughGateway(8080, `pr-7-${previewSlug}.localhost`, '/version');
+    const servedA = await requestThroughGateway(8081, `pr-7-${previewSlug}.localhost`, '/version');
     expect(servedA.body.trim()).toBe('revision-a');
 
     // synchronize: same URL, new content.
@@ -189,7 +189,7 @@ test.describe.serial('queue & preview UI (v0.7)', () => {
       if (d.status === 'RUNNING') break;
       await new Promise((r) => setTimeout(r, 1000));
     }
-    const servedB = await requestThroughGateway(8080, `pr-7-${previewSlug}.localhost`, '/version');
+    const servedB = await requestThroughGateway(8081, `pr-7-${previewSlug}.localhost`, '/version');
     expect(servedB.body.trim()).toBe('revision-b');
 
     // The dashboard reflects the new head SHA on the preview row.
@@ -199,7 +199,7 @@ test.describe.serial('queue & preview UI (v0.7)', () => {
     // close: route disappears; panel marks it closed.
     const close = await sendPullRequest('closed', 7, rev1);
     expect(close.status).toBe(200);
-    const goneAfterClose = await requestThroughGateway(8080, `pr-7-${previewSlug}.localhost`);
+    const goneAfterClose = await requestThroughGateway(8081, `pr-7-${previewSlug}.localhost`);
     expect(goneAfterClose.status).toBe(503);
     // The panel moves the environment to the collapsed "closed" section; the
     // authoritative state comes from the API.
