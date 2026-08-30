@@ -23,9 +23,8 @@ export default async function globalTeardown() {
     console.warn('[e2e-teardown] Docker cleanup incomplete:', String(error).slice(0, 200));
   }
 
-  try {
-    await dropE2eDatabase();
-  } catch (error) {
-    console.warn('[e2e-teardown] database cleanup incomplete:', String(error).slice(0, 200));
-  }
+  // Do NOT drop the E2E database here; it may be reused by subsequent test
+  // files within the same Playwright run. The database is created fresh
+  // before each full test run via npm run pretest:e2e.
+  // await dropE2eDatabase();
 }
