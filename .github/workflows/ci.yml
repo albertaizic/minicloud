@@ -92,7 +92,7 @@ jobs:
       # Serial worker, real Docker builds; generous per-test budget but no
       # continue-on-error — failures must fail the gate.
       - name: Run Playwright suite
-        run: npm run test:e2e
+        run: npx playwright test --config=e2e/playwright.config.ts --reporter=line
         env:
           CI: 'true'
 
