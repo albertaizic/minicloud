@@ -22,7 +22,7 @@
     "dev": "npm run dev --workspace @minicloud/api",
     "dev:dashboard": "npm run dev --workspace @minicloud/dashboard",
     "db:up": "docker compose up -d postgres && npm run migrate --workspace @minicloud/db",
-    "migrate": "npm run migrate --workspace @minicloud/db",
+    "pretest:e2e": "node e2e/helpers/ensure-test-db.mjs",
     "test:e2e": "playwright test --config e2e/playwright.config.ts"
   },
   "devDependencies": {
