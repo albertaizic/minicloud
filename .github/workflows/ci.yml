@@ -92,14 +92,15 @@ jobs:
       # Serial worker, real Docker builds; generous per-test budget but no
       # continue-on-error — failures must fail the gate.
       - name: Run Playwright suite
-        run: npx playwright test --config=e2e/playwright.config.ts --reporter=line
+        run: |
+          npx playwright test --config=e2e/playwright.config.ts --reporter=line,json
+          npx playwright test --config=e2e/playwright.config.ts --reporter=json --output=playwright-results.json 2>&1 || true
         env:
           CI: 'true'
-
-      - name: Upload Playwright artifacts on failure
-        if: failure()
+      - name: Upload Playwright results
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: playwright-artifacts
-          path: e2e-artifacts/results
+          name: playwright-results
+          path: playwright-results.json
           retention-days: 5
