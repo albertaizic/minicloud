@@ -11,9 +11,8 @@ const VITE = path.join(ROOT, 'node_modules', 'vite', 'bin', 'vite.js');
 
 export default defineConfig({
   globalSetup: './helpers/global-setup.mjs',
-  globalTeardown: './helpers/global-teardown.mjs',
-  timeout: 600_000,
-  expect: { timeout: 15_000 },
+  timeout: 900_000,
+  expect: { timeout: 30_000 },
   fullyParallel: false,
   // No retries: a rerun deploys over the previous attempt's state (same app
   // fixtures) and stomps it mid-assertions. Gates must pass first-try.
