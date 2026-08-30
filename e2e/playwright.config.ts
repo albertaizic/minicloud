@@ -11,6 +11,7 @@ const VITE = path.join(ROOT, 'node_modules', 'vite', 'bin', 'vite.js');
 
 export default defineConfig({
   globalSetup: './helpers/global-setup.mjs',
+  globalTeardown: './helpers/global-teardown.mjs',
   timeout: 900_000,
   expect: { timeout: 30_000 },
   fullyParallel: false,
@@ -74,3 +75,5 @@ export default defineConfig({
       },
       env: { MINICLOUD_API_URL: `http://localhost:${API_PORT}` },
     },
+  ],
+});
