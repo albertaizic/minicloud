@@ -111,6 +111,7 @@ test.describe.serial('multi-service + zero-downtime UI (real stack)', () => {
       const appRow = (await apiGet(`/api/apps/${appId}`)) as { activeDeploymentId?: string; deployments: Array<{ id: string; status: string; isActive: boolean; rollbackOf: string | null }> };
       const act = appRow.activeDeploymentId ?? '';
       const actRow = appRow.deployments.find((d) => d.id === act);
+      console.log(`[ROLLBACK DEBUG] iteration ${i}: active=${act}, actRow=${actRow ? JSON.stringify(actRow) : 'none'}, depA=${depA}, depB=${depB}`);
       if (act && act !== depB && actRow?.rollbackOf === depA) {
         rolledBack = true;
         const home = await appUrl('e2e-msvc');
