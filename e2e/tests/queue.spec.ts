@@ -2,12 +2,13 @@
 // work obvious, cancellable, and keep PREVIEW traffic visually distinct.
 import crypto from 'node:crypto';
 import http from 'node:http';
-import { execFileSync } from 'node:child_process';
+import pg from 'pg';
 import { test, expect } from '@playwright/test';
 import {
   API,
   attachErrorCollectors, apiGet, apiDelete, expectNoErrors,
 } from '../helpers/support.js';
+import { databaseUrls } from '../helpers/postgres.mjs';
 
 const SECRET = 'e2e-whsec-0123456789abcdef';
 
@@ -15,15 +16,20 @@ function sign(payload: string): string {
   return `sha256=${crypto.createHmac('sha256', SECRET).update(payload).digest('hex')}`;
 }
 
-function setWebhookSecret(appId: string): void {
+async function setWebhookSecret(appId: string): Promise<void> {
   // MiniCloud has no secret-read/write REST surface for webhook secrets by
   // design; tests seed it directly into the E2E database.
-  execFileSync(
-    'docker',
-    ['exec', 'minicloud-postgres', 'psql', '-U', 'minicloud', '-d', 'minicloud_e2e',
-     '-c', `UPDATE applications SET webhook_secret = '${SECRET}' WHERE id = '${appId}'`],
-    { stdio: 'pipe', timeout: 15_000 },
-  );
+  const { e2eUrl } = databaseUrls();
+  const client = new pg.Client({ connectionString: e2eUrl });
+  await client.connect();
+  try {
+    await client.query(
+      `UPDATE applications SET webhook_secret = $1 WHERE id = $2`,
+      [SECRET, appId],
+    );
+  } finally {
+    await client.end();
+  }
 }
 
 async function createAppWithWebhook(name: string, repoUrl: string): Promise<{ appId: string; slug: string }> {

@@ -55,7 +55,7 @@ export default defineConfig({
         WORKSPACE_DIR: path.join(ROOT, '.minicloud', 'e2e-workspace'),
         PORT_RANGE_START: '34000',
         PORT_RANGE_END: '34999',
-        LOG_LEVEL: 'warn',
+        LOG_LEVEL: 'debug',
         CRASH_MONITOR_INTERVAL_MS: '3000',
         // CRITICAL: Point the API at the E2E database, not the dev database
         DATABASE_URL: 'postgres://minicloud:minicloud@localhost:5433/minicloud_e2e',

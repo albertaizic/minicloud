@@ -91,5 +91,5 @@ const server = http.createServer((req, res) => {
     .catch(() => res.writeHead(404).end());
 });
 
-const port = Number(process.env.PORT ?? 4555);
+const port = 4555;
 server.listen(port, () => console.log(`e2e fixtures on http://127.0.0.1:${port}`));

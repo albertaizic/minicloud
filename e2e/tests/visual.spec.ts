@@ -116,7 +116,9 @@ test.describe.serial('visual / UX audit', () => {
     const page = await ctx.newPage();
     await page.goto(`/deployments/${dep}`);
     await expect(page.getByRole('heading', { name: /services/i })).toBeVisible();
-    await expect(page.locator('table').getByText('worker')).toBeVisible();
+    // The services table follows the Services heading; scope to that table.
+    const servicesTable = page.getByRole('table').first();
+    await expect(servicesTable.getByRole('cell', { name: 'worker', exact: true }).first()).toBeVisible();
     await shoot(page, `07-multiservice-1440`);
     await expectNoHorizontalOverflow(page, 'multiservice');
     await ctx.close();

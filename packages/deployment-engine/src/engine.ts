@@ -510,7 +510,7 @@ export class DeploymentEngine {
         await fail('manifest', 'rollback target has an invalid manifest snapshot');
         return;
       }
-      await this.pipelineMulti(deploymentId, app, expectedOld, current.commit_sha ?? '', manifest, null, rollbackTarget);
+      await this.pipelineMulti(deploymentId, app, app.active_deployment_id, current.commit_sha ?? '', manifest, null, rollbackTarget);
       return;
     }
 
@@ -1397,6 +1397,7 @@ export class DeploymentEngine {
           }
         }
       }
+      // Build cache status
       if (needBuild && repoDir) {
         await this.deployments.updateFields(deploymentId, {
           build_cache: reusedCount === 0 ? 'miss' : builtCount === 0 ? 'image_reused' : 'partial',
@@ -1716,16 +1717,19 @@ export class DeploymentEngine {
         await this.retireMulti(deploymentId, 'superseded during cutover');
         return;
       }
-
       // Routes: <slug> -> first public service; <service>.<slug> -> each.
       for (const r of publicRoutes) {
-        gw.setRoute(r.key, this.upstreamFor(deploymentId, r.hostPort) ?? { deploymentId, host: '127.0.0.1', port: r.hostPort });
+        const upstream = this.upstreamFor(deploymentId, r.hostPort) ?? { deploymentId, host: '127.0.0.1', port: r.hostPort };
+        this.logger.warn('ACTIVATE-MULTI setRoute', { key: r.key, upstream });
+        gw.setRoute(r.key, upstream);
       }
 
       // Verify every public route through the gateway.
       let allVerified = true;
       for (const r of publicRoutes) {
-        if (!(await gw.verifyRoute(r.key, r.healthPath))) {
+        const verified = await gw.verifyRoute(r.key, r.healthPath);
+        this.logger.warn('ACTIVATE-MULTI verifyRoute', { key: r.key, healthPath: r.healthPath, verified });
+        if (!verified) {
           allVerified = false;
           break;
         }
