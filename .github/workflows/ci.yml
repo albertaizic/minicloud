@@ -112,8 +112,8 @@ jobs:
       - name: Run Playwright suite
         run: |
           set +e
-          PLAYWRIGHT_JSON_OUTPUT_NAME=playwright-results.json npx playwright test --config=e2e/playwright.config.ts --reporter=line,json
-          status=$?
+          npx playwright test --config=e2e/playwright.config.ts --reporter=line,json 2>&1 | tee playwright-results.json
+          status=${PIPESTATUS[0]}
           exit $status
         env:
           CI: 'true'
