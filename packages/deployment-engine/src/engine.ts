@@ -70,9 +70,18 @@ export interface EngineConfig {
 export interface TrafficGateway {
   setRoute(slug: string, upstream: { deploymentId: string; host: string; port: number } | null): void;
   activeRequests(slug: string): number;
-  verifyRoute(slug: string, path: string): Promise<boolean>;
+  /**
+   * End-to-end verification: the route is live AND points at the deployment
+   * the engine believes should be serving (when `expectedDeploymentId` is
+   * supplied). Without the identity check, a stale route serving the wrong
+   * upstream would still pass the legacy liveness probe.
+   */
+  verifyRoute(
+    slug: string,
+    path: string,
+    opts?: { expectedDeploymentId?: string; attempts?: number; timeoutMs?: number },
+  ): Promise<boolean>;
 }
-
 export interface EngineLogger {
   info: (msg: string, obj?: Record<string, unknown>) => void;
   warn: (msg: string, obj?: Record<string, unknown>) => void;
@@ -152,6 +161,7 @@ export const TRAFFIC_EVENTS = {
   routeUpdated: 'gateway.route_updated',
   upstreamUnavailable: 'gateway.upstream_unavailable',
   superseded: 'deployment.superseded',
+  rollbackIdentityWarning: 'rollback.identity_warning',
 } as const;
 
 /** Multi-service events (v0.5) — metadata carries serviceName, never secrets. */
@@ -323,7 +333,7 @@ export class DeploymentEngine {
       }
       gw.setRoute(slug, this.upstreamFor(deploymentId, hostPort));
 
-      const verified = await gw.verifyRoute(slug, healthPath);
+      const verified = await gw.verifyRoute(slug, healthPath, { expectedDeploymentId: deploymentId });
       if (!verified) {
         await this.event(deploymentId, TRAFFIC_EVENTS.cutoverFailed, 'gateway verification failed; reverting traffic', {
           from: current,
@@ -1095,7 +1105,7 @@ export class DeploymentEngine {
       if (app.active_deployment_id === deploymentId && this.gateway && app.route_slug) {
         const upstream = this.upstreamFor(deploymentId, hostPort);
         if (upstream) this.gateway.setRoute(app.route_slug, upstream);
-        const ok = this.gateway ? await this.gateway.verifyRoute(app.route_slug, healthPath) : false;
+        const ok = this.gateway ? await this.gateway.verifyRoute(app.route_slug, healthPath, { expectedDeploymentId: deploymentId }) : false;
         await this.event(
           deploymentId,
           TRAFFIC_EVENTS.routeUpdated,
@@ -1118,7 +1128,7 @@ export class DeploymentEngine {
         if (swappedBack && this.gateway && app.route_slug) {
           const restoredUpstream = this.upstreamFor(deploymentId, hostPort);
           if (restoredUpstream) this.gateway.setRoute(app.route_slug, restoredUpstream);
-          const verified = await this.gateway.verifyRoute(app.route_slug, healthPath);
+          const verified = await this.gateway.verifyRoute(app.route_slug, healthPath, { expectedDeploymentId: deploymentId });
           await this.event(
             deploymentId,
             TRAFFIC_EVENTS.routeUpdated,
@@ -1300,6 +1310,13 @@ export class DeploymentEngine {
       }
 
       // Rollback image reuse: per-service images from the target deployment.
+      // Beyond reusing per-service image tags, we also verify that the target's
+      // image DIGEST differs from the current active deployment's for every
+      // service — same tag-different-build isn't possible (tags are unique
+      // per deployment), but identical digests mean the source code is the
+      // same, which silently produces a "rollback" that still serves the
+      // same content. This is a regression-guard for tests and dashboards
+      // that forget to pin two distinct revisions.
       let reusedImages: Record<string, string> | null = null;
       if (rollbackTarget) {
         const targetServices = await this.services.listByDeployment(rollbackTarget.id);
@@ -1311,10 +1328,48 @@ export class DeploymentEngine {
         }
         if (Object.keys(images).length === targetServices.length) {
           reusedImages = images; // full set available: skip clone/build entirely
+          // Identity guard — log when rollback reuses content that the
+          // active deployment already serves. Useful diagnostics for the
+          // dashboard that deploys twice from HEAD and expects different
+          // content.
+          const activeDep = app.active_deployment_id
+            ? await this.deployments.byId(app.active_deployment_id)
+            : null;
+          if (activeDep) {
+            const activeSvcs = await this.services.listByDeployment(activeDep.id);
+            for (const ts of targetServices) {
+              const reused = images[ts.service_name];
+              if (!reused) continue;
+              const targetDigest = await this.docker.imageDigest(reused).catch(() => null);
+              const activeSvc = activeSvcs.find((s) => s.service_name === ts.service_name);
+              const activeDigest = activeSvc?.image_tag
+                ? await this.docker.imageDigest(activeSvc.image_tag).catch(() => null)
+                : null;
+              if (targetDigest && activeDigest && targetDigest === activeDigest) {
+                this.logger.warn(
+                  'rollback image matches active deployment; rollback will not change served content',
+                  {
+                    deploymentId,
+                    serviceName: ts.service_name,
+                    rollbackTargetId: rollbackTarget.id,
+                    activeDeploymentId: activeDep.id,
+                    imageDigest: targetDigest,
+                    rollbackRef: rollbackTarget.commit_sha,
+                    activeRef: activeDep.commit_sha,
+                  },
+                );
+                await this.event(
+                  deploymentId,
+                  TRAFFIC_EVENTS.rollbackIdentityWarning,
+                  `${ts.service_name} image matches active (digest ${targetDigest.slice(0, 12)})`,
+                  { serviceName: ts.service_name, imageDigest: targetDigest },
+                );
+              }
+            }
+          }
         }
       }
       const needBuild = !reusedImages;
-
       // Build every service image, with exact-image reuse per service.
       let reusedCount = 0;
       let builtCount = 0;
@@ -1443,42 +1498,45 @@ export class DeploymentEngine {
         }
 
         const isPublic = svcDef.public && !!svcDef.port;
+        const containerName = `minicloud-d-${deploymentId.slice(0, 12)}-${svcName}`;
+        await this.event(deploymentId, SERVICE_EVENTS.starting, svcName, { serviceName: svcName });
         let hostPort = 0;
-        if (isPublic) {
+        let containerId: string | null = null;
+        let lastStartError: unknown;
+        const startAttempts = isPublic ? 3 : 1;
+
+        for (let attempt = 0; attempt < startAttempts; attempt++) {
           try {
-            hostPort = await allocatePort(this.config.portRange);
-            if (!(await canBind(hostPort))) throw new EngineError('port became unavailable', 'port');
+            if (isPublic) {
+              hostPort = await allocatePort(this.config.portRange);
+              if (!(await canBind(hostPort))) continue;
+            }
+            const started = await this.docker.startManagedContainer({
+              image,
+              name: containerName,
+              appLabel: app.id,
+              deploymentLabel: deploymentId,
+              serviceLabel: svcName,
+              containerPort: svcDef.port ?? 0,
+              hostPort,
+              env,
+              limits: svcDef.resources
+                ? this.dockerLimits({ memoryLimitMb: svcDef.resources.memoryLimitMb, cpuLimit: svcDef.resources.cpuLimit })
+                : {},
+              networks: [{ name: appNetwork, alias: svcName }],
+              volumeMounts: volumeMountsByService[svcName] ?? [],
+            });
+            containerId = started.id;
+            break;
           } catch (err) {
-            await this.cleanupFailedStart(deploymentId, startedContainers);
-            await fail('port', `service "${svcName}": ${err instanceof Error ? err.message : String(err)}`);
-            if (repoDir) await repoCleanup(repoDir);
-            return;
+            lastStartError = err;
+            if (!isPublic || !/address already in use|port is already allocated/i.test(String(err))) break;
           }
         }
 
-        const containerName = `minicloud-d-${deploymentId.slice(0, 12)}-${svcName}`;
-        await this.event(deploymentId, SERVICE_EVENTS.starting, svcName, { serviceName: svcName });
-        let containerId: string;
-        try {
-          const started = await this.docker.startManagedContainer({
-            image,
-            name: containerName,
-            appLabel: app.id,
-            deploymentLabel: deploymentId,
-            serviceLabel: svcName,
-            containerPort: svcDef.port ?? 0,
-            hostPort,
-            env,
-            limits: svcDef.resources
-              ? this.dockerLimits({ memoryLimitMb: svcDef.resources.memoryLimitMb, cpuLimit: svcDef.resources.cpuLimit })
-              : {},
-            networks: [{ name: appNetwork, alias: svcName }],
-            volumeMounts: volumeMountsByService[svcName] ?? [],
-          });
-          containerId = started.id;
-        } catch (err) {
+        if (!containerId) {
           await this.cleanupFailedStart(deploymentId, startedContainers);
-          await fail('start', `service "${svcName}": ${err instanceof Error ? err.message : String(err)}`);
+          await fail('start', `service "${svcName}": ${lastStartError instanceof Error ? lastStartError.message : String(lastStartError ?? 'port became unavailable')}`);
           if (repoDir) await repoCleanup(repoDir);
           return;
         }
@@ -1614,19 +1672,13 @@ export class DeploymentEngine {
         from: current,
         to: deploymentId,
       });
-      const swapped = await this.previews.setActiveDeployment(envId, deploymentId, expectedOldDep);
-      if (!swapped) {
-        await this.event(deploymentId, TRAFFIC_EVENTS.superseded, 'preview traffic switched elsewhere during cutover');
-        await this.retireAny(deploymentId, 'superseded during preview cutover');
-        return;
-      }
       for (const r of publicRoutes) {
         gw.setRoute(r.key, { deploymentId, host: '127.0.0.1', port: r.hostPort });
       }
 
       let allVerified = true;
       for (const r of publicRoutes) {
-        if (!(await gw.verifyRoute(r.key, r.healthPath))) {
+        if (!(await gw.verifyRoute(r.key, r.healthPath, { expectedDeploymentId: deploymentId }))) {
           allVerified = false;
           break;
         }
@@ -1636,7 +1688,6 @@ export class DeploymentEngine {
           previewEnvironmentId: envId,
         });
         if (current) {
-          await this.previews.setActiveDeployment(envId, current, deploymentId);
           const oldRow = await this.deployments.byId(current);
           if (oldRow?.manifest_snapshot) {
             for (const os of await this.services.listByDeployment(current)) {
@@ -1650,9 +1701,29 @@ export class DeploymentEngine {
           }
         } else {
           for (const r of publicRoutes) gw.setRoute(r.key, null);
-          await this.previews.clearActiveDeployment(envId, deploymentId);
         }
         await this.retireAny(deploymentId, 'preview cutover verification failed; previous preview kept serving');
+        return;
+      }
+
+      const swapped = await this.previews.setActiveDeployment(envId, deploymentId, current);
+      if (!swapped) {
+        await this.event(deploymentId, TRAFFIC_EVENTS.superseded, 'preview traffic switched elsewhere during cutover');
+        if (current) {
+          const oldRow = await this.deployments.byId(current);
+          if (oldRow?.manifest_snapshot) {
+            for (const os of await this.services.listByDeployment(current)) {
+              if (!os.public_service || !os.host_port) continue;
+              const key = os.service_name === publicRoutes[0]?.service ? routeKey : `${os.service_name}.${routeKey}`;
+              gw.setRoute(key, { deploymentId: current, host: '127.0.0.1', port: os.host_port });
+            }
+          } else if (oldRow?.host_port) {
+            gw.setRoute(routeKey, { deploymentId: current, host: '127.0.0.1', port: oldRow.host_port });
+          }
+        } else {
+          for (const r of publicRoutes) gw.setRoute(r.key, null);
+        }
+        await this.retireAny(deploymentId, 'superseded during preview cutover');
         return;
       }
 
@@ -1699,7 +1770,13 @@ export class DeploymentEngine {
       const fresh = await this.apps.byId(app.id);
       if (!fresh) return;
       const current = fresh.active_deployment_id;
-      this.logger.warn('ACTIVATE-MULTI', { deploymentId: short(deploymentId), expectedOld: expectedOld ? short(expectedOld) : null, current: current ? short(current) : null });
+      this.logger.info('activateMulti', {
+        deploymentId: short(deploymentId),
+        appId: short(app.id),
+        publicRouteCount: publicRoutes.length,
+        expectedOld: expectedOld ? short(expectedOld) : null,
+        current: current ? short(current) : null,
+      });
       if (current === deploymentId) return;
       if (current !== expectedOld) {
         await this.event(deploymentId, TRAFFIC_EVENTS.superseded, `traffic moved to ${short(current ?? '?')}`);
@@ -1711,24 +1788,19 @@ export class DeploymentEngine {
         from: current,
         to: deploymentId,
       });
-      const swapped = await this.apps.setActiveDeployment(app.id, deploymentId, current);
-      if (!swapped) {
-        await this.event(deploymentId, TRAFFIC_EVENTS.superseded, 'traffic switched elsewhere during cutover');
-        await this.retireMulti(deploymentId, 'superseded during cutover');
-        return;
-      }
       // Routes: <slug> -> first public service; <service>.<slug> -> each.
+      // Do not publish the durable active pointer until the gateway has
+      // accepted and verified every candidate target.
       for (const r of publicRoutes) {
-        const upstream = this.upstreamFor(deploymentId, r.hostPort) ?? { deploymentId, host: '127.0.0.1', port: r.hostPort };
-        this.logger.warn('ACTIVATE-MULTI setRoute', { key: r.key, upstream });
-        gw.setRoute(r.key, upstream);
+        gw.setRoute(r.key, this.upstreamFor(deploymentId, r.hostPort) ?? { deploymentId, host: '127.0.0.1', port: r.hostPort });
       }
 
-      // Verify every public route through the gateway.
+      // Verify every public route through the gateway (identity-strong: each
+      // route must point at THIS deployment, otherwise we'd silently serve
+      // a stale upstream).
       let allVerified = true;
       for (const r of publicRoutes) {
-        const verified = await gw.verifyRoute(r.key, r.healthPath);
-        this.logger.warn('ACTIVATE-MULTI verifyRoute', { key: r.key, healthPath: r.healthPath, verified });
+        const verified = await gw.verifyRoute(r.key, r.healthPath, { expectedDeploymentId: deploymentId });
         if (!verified) {
           allVerified = false;
           break;
@@ -1737,7 +1809,6 @@ export class DeploymentEngine {
       if (!allVerified) {
         await this.event(deploymentId, TRAFFIC_EVENTS.cutoverFailed, 'gateway verification failed; reverting traffic');
         if (current) {
-          await this.apps.setActiveDeployment(app.id, current, deploymentId);
           const oldServices = await this.services.listByDeployment(current);
           for (const os of oldServices) {
             if (os.public_service && os.host_port) {
@@ -1747,9 +1818,24 @@ export class DeploymentEngine {
           }
         } else {
           for (const r of publicRoutes) gw.setRoute(r.key, null);
-          await this.apps.clearActiveDeployment(app.id, deploymentId);
         }
         await this.retireMulti(deploymentId, 'cutover verification failed; previous version kept serving');
+        return;
+      }
+
+      const swapped = await this.apps.setActiveDeployment(app.id, deploymentId, current);
+      if (!swapped) {
+        await this.event(deploymentId, TRAFFIC_EVENTS.superseded, 'traffic switched elsewhere during cutover');
+        if (current) {
+          for (const os of await this.services.listByDeployment(current)) {
+            if (!os.public_service || !os.host_port) continue;
+            const key = os.service_name === publicRoutes[0]?.service ? app.route_slug! : `${os.service_name}.${app.route_slug}`;
+            gw.setRoute(key, this.upstreamFor(current, os.host_port) ?? { deploymentId: current, host: '127.0.0.1', port: os.host_port });
+          }
+        } else {
+          for (const r of publicRoutes) gw.setRoute(r.key, null);
+        }
+        await this.retireMulti(deploymentId, 'superseded during cutover');
         return;
       }
 

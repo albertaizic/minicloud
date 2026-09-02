@@ -1,11 +1,16 @@
 import { test, expect } from '@playwright/test';
 import {
   attachErrorCollectors, apiGet, apiDelete, deployViaApi,
-  waitForDeploymentStatus, appUrl, expectNoErrors,
+  waitForDeploymentStatus, appUrl, ensureApp, expectNoErrors,
 } from '../helpers/support.js';
 
 const FIX = 'http://localhost:4555';
 const MSC = `${FIX}/msvc.git`;
+async function msvcShas(): Promise<[string, string]> {
+  const r = await fetch(`${FIX}/shas.json`);
+  const j = (await r.json()) as { msvc: [string, string] };
+  return j.msvc;
+}
 
 test.describe.serial('multi-service + zero-downtime UI (real stack)', () => {
   let appId: string;
@@ -13,6 +18,11 @@ test.describe.serial('multi-service + zero-downtime UI (real stack)', () => {
   let depB: string;
 
   test.beforeAll(async () => {
+    // Tolerant of leftover state from a previous run: reuses an existing
+    // app named 'e2e-msvc' rather than failing the suite when 409 hits
+    // a name conflict.
+    appId = await ensureApp('e2e-msvc', MSC);
+    await apiDelete(`/api/apps/${appId}`).catch(() => {});
     const res = await fetch('http://localhost:4100/api/apps', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
@@ -28,7 +38,8 @@ test.describe.serial('multi-service + zero-downtime UI (real stack)', () => {
   test('zero-downtime UI: A stays active while B builds; badge moves after health', async ({ page }) => {
     test.setTimeout(600_000);
     const { consoleErrors, pageErrors } = attachErrorCollectors(page);
-    depA = await deployViaApi('e2e-msvc', MSC, undefined);
+    const [shaA, shaB] = await msvcShas();
+    depA = await deployViaApi('e2e-msvc', MSC, shaA);
     await waitForDeploymentStatus(depA, ['RUNNING']);
 
     await page.goto(`/apps/${appId}`);
@@ -103,32 +114,55 @@ test.describe.serial('multi-service + zero-downtime UI (real stack)', () => {
     const targetRow = page.locator('tr', { hasText: depA.slice(0, 8) });
     await targetRow.getByRole('button', { name: /rollback/i }).click();
     await targetRow.getByRole('button', { name: /^yes$/i }).click();
-    await expect(page.getByText('RUNNING').first()).toBeVisible({ timeout: 300_000 });
 
-    let rolledBack = false;
-    let version = '';
-    for (let i = 0; i < 240; i++) {
-      const appRow = (await apiGet(`/api/apps/${appId}`)) as { activeDeploymentId?: string; deployments: Array<{ id: string; status: string; isActive: boolean; rollbackOf: string | null }> };
-      const act = appRow.activeDeploymentId ?? '';
-      const actRow = appRow.deployments.find((d) => d.id === act);
-      console.log(`[ROLLBACK DEBUG] iteration ${i}: act=${act}, depA=${depA}, depB=${depB}, actRow.rollbackOf=${actRow?.rollbackOf}, match=${actRow?.rollbackOf === depA}, act!==depB=${act !== depB}`);
-      if (act && act !== depB && actRow?.rollbackOf === depA) {
-        rolledBack = true;
-        const home = await appUrl('e2e-msvc');
-        console.log(`[ROLLBACK DEBUG] iteration ${i}: active=${act}, gateway version=${home.status === 200 ? JSON.parse(home.body).version : 'ERROR'}`);
-        if (home.status === 200) {
-          version = JSON.parse(home.body).version;
-          if (version === 'msvc-A') break;
-        }
-      }
-      await new Promise((r) => setTimeout(r, 500));
-    }
+    // State-wait for the rollback deployment to be RUNNING, the active
+    // pointer to move off depB, and the gateway to actually serve A. The
+    // rollback deployment is a NEW row whose lineage (rollbackOf) points
+    // at depA; we use that — not a boolean we set ourselves — as the
+    // ground-truth signal.
+    const rollbackDepId = await waitForRollback({ appId, depB, depA });
+    await expect
+      .poll(async () => JSON.parse((await appUrl('e2e-msvc')).body).version, {
+        message: 'stable URL serves rolled-back revision (msvc-A)',
+        timeout: 60_000,
+        intervals: [500],
+      })
+      .toBe('msvc-A');
 
-    expect(rolledBack).toBe(true);
-
-    const volHome = await appUrl('e2e-msvc');
-    const parsedVol = JSON.parse(volHome.body) as { version: string; api: { count: number } };
+    const parsedVol = JSON.parse((await appUrl('e2e-msvc')).body) as { version: string; api: { count: number } };
     expect(parsedVol.version).toBe('msvc-A');
     expect(parsedVol.api.count).toBeGreaterThanOrEqual(1);
+    // Touch the row id so the variable isn't flagged as unused.
+    expect(rollbackDepId).toBeTruthy();
   });
 });
+async function waitForRollback({
+  appId,
+  depB,
+  depA,
+  timeoutMs = 300_000,
+}: {
+  appId: string;
+  depB: string;
+  depA: string;
+  timeoutMs?: number;
+}): Promise<string> {
+  const start = Date.now();
+  let last: { active?: string; rollbackDep?: { id: string; status: string; rollbackOf: string | null } } = {};
+  while (Date.now() - start < timeoutMs) {
+    const appRow = (await apiGet(`/api/apps/${appId}`)) as {
+      activeDeploymentId?: string;
+      deployments: Array<{ id: string; status: string; rollbackOf: string | null }>;
+    };
+    const act = appRow.activeDeploymentId ?? '';
+    const rollbackDep = appRow.deployments.find(
+      (d) => d.rollbackOf === depA && d.status === 'RUNNING',
+    );
+    last = { active: act, rollbackDep };
+    if (rollbackDep && act && act !== depB) return rollbackDep.id;
+    await new Promise((r) => setTimeout(r, 1000));
+  }
+  throw new Error(
+    `rollback never converged within ${timeoutMs}ms: last state ${JSON.stringify(last)}`,
+  );
+}

@@ -22,7 +22,9 @@ afterAll(async () => {
 });
 
 async function depStatus(deploymentId: string): Promise<string> {
-  return (await ctx.app.inject({ method: 'GET', url: `/api/deployments/${deploymentId}` })).json().status as string;
+  const res = await ctx.app.inject({ method: 'GET', url: `/api/deployments/${deploymentId}` });
+  if (res.statusCode !== 200) throw new Error(`deployment ${deploymentId} lookup failed: ${res.statusCode} ${res.body}`);
+  return res.json().status as string;
 }
 
 function waitForStatus(deploymentId: string, statuses: string[], timeoutMs = 240_000): Promise<string> {
@@ -164,13 +166,7 @@ describe('multi-service deployments (real docker)', () => {
     });
     expect(res.statusCode).toBe(202);
     dep3 = res.json().deployment.id as string;
-    try {
-      await waitForStatus(dep3, ['RUNNING']);
-    } catch (e) {
-      const row = (await ctx.app.inject({ method: 'GET', url: `/api/deployments/${dep3}` })).json();
-      console.error('ROLLBACK FAILED:', row.failureReason);
-      throw e;
-    }
+    await waitForStatus(dep3, ['RUNNING']);
 
     // Cutover completes right after RUNNING: poll for the version flip.
     const start = Date.now();
@@ -185,9 +181,39 @@ describe('multi-service deployments (real docker)', () => {
     }
     expect(parsed?.version).toBe('msvc-A'); // version rolled back...
     expect(parsed!.api.count).toBeGreaterThanOrEqual(1); // ...data did NOT
-
+    const app = (await ctx.app.inject({ method: 'GET', url: `/api/apps/${appId}` })).json();
+    const routes = (await ctx.app.inject({ method: 'GET', url: '/api/routes' })).json();
+    expect(app.activeDeploymentId).toBe(dep3);
+    expect(routes.routes.find((route: { slug: string }) => route.slug === 'ms-app')?.deploymentId).toBe(dep3);
     await waitForStatus(dep2, ['STOPPED'], 60_000);
   }, 420_000);
+
+  it('rollback emits an identity warning when the rollback target image matches the active deployment image', async () => {
+    // A "no-op rollback" — both dep1 and dep2 were built from the same commit
+    // (the test dashboard deploys both with ref=undefined → HEAD). The rollback
+    // still completes (DB pointer moves, gateway swaps) but the served content
+    // is unchanged because the reused image digest is identical. This regression
+    // guard ensures the engine emits a structured signal so dashboards and
+    // tests that fail to pin two distinct revisions see WHY.
+    const sameApp = await createApp('ms-identity', 'msvc');
+    const sameDepA = await deploy(sameApp);
+    await waitForStatus(sameDepA, ['RUNNING']);
+    const sameDepB = await deploy(sameApp);
+    await waitForStatus(sameDepB, ['RUNNING']);
+    const rb = await ctx.app.inject({
+      method: 'POST', url: `/api/apps/${sameApp}/rollback`,
+      payload: { targetDeploymentId: sameDepA },
+    });
+    expect(rb.statusCode).toBe(202);
+    const sameDepR = rb.json().deployment.id as string;
+    await waitForStatus(sameDepR, ['RUNNING'], 300_000);
+    const eventsRes = await ctx.app.inject({
+      method: 'GET', url: `/api/deployments/${sameDepR}/events`,
+    });
+    const events = (eventsRes.json() as { events: Array<{ type: string }> }).events;
+    const identityWarnings = events.filter((e) => e.type === 'rollback.identity_warning');
+    expect(identityWarnings.length).toBeGreaterThan(0);
+  }, 600_000);
 
   it('worker crash recovers independently; web keeps serving', async () => {
     const detail = (await ctx.app.inject({ method: 'GET', url: `/api/deployments/${dep3}` })).json();

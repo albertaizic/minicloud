@@ -15,6 +15,9 @@ export default defineConfig({
   timeout: 900_000,
   expect: { timeout: 30_000 },
   fullyParallel: false,
+  // The real stack owns one deployment build slot. More browser workers only
+  // create queued deployments that can exceed individual test contracts.
+  workers: 1,
   // No retries: a rerun deploys over the previous attempt's state (same app
   // fixtures) and stomps it mid-assertions. Gates must pass first-try.
   retries: 0,

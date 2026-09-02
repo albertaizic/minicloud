@@ -156,4 +156,39 @@ describe('gateway proxying', () => {
     expect(await gateway.verifyRoute('app', '/')).toBe(true);
     expect(await gateway.verifyRoute('nope', '/')).toBe(false);
   });
+
+  it('verifyRoute with expectedDeploymentId rejects when the route points elsewhere', async () => {
+    // Route currently points at dep-1; verifying against dep-2 must fail.
+    expect(await gateway.verifyRoute('app', '/', { expectedDeploymentId: 'dep-2' })).toBe(false);
+    // And succeeds when the expected id matches reality.
+    expect(await gateway.verifyRoute('app', '/', { expectedDeploymentId: 'dep-1' })).toBe(true);
+  });
+
+  it('verifyRoute with expectedDeploymentId fails when no route exists', async () => {
+    expect(await gateway.verifyRoute('nope', '/', { expectedDeploymentId: 'dep-1' })).toBe(false);
+  });
+
+  it('route-info admin endpoint returns the route deploymentId for the engine', async () => {
+    const res = await gwRequest('app.localhost', '/__minicloud__/route-info/app');
+    expect(res.status).toBe(200);
+    const body = JSON.parse(res.body) as { deploymentId: string; host: string; port: number };
+    expect(body.deploymentId).toBe('dep-1');
+    expect(body.host).toBe('127.0.0.1');
+    expect(body.port).toBe(upstreamPort);
+  });
+
+  it('route-info admin endpoint reports no route when the slug is unknown', async () => {
+    const res = await gwRequest('app.localhost', '/__minicloud__/route-info/nope');
+    expect(res.status).toBe(404);
+  });
+
+  it('route swap followed by verifyRoute identity check returns false until the swap matches', async () => {
+    // Stale route pointing at dep-1: identity check against dep-2 fails.
+    expect(await gateway.verifyRoute('app', '/', { expectedDeploymentId: 'dep-2' })).toBe(false);
+    // Swap and re-verify.
+    gateway.setRoute('app', { deploymentId: 'dep-2', host: '127.0.0.1', port: upstreamPort });
+    expect(await gateway.verifyRoute('app', '/', { expectedDeploymentId: 'dep-2' })).toBe(true);
+    // Restore for downstream assertions.
+    gateway.setRoute('app', { deploymentId: 'dep-1', host: '127.0.0.1', port: upstreamPort });
+  });
 });

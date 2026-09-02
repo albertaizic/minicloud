@@ -156,10 +156,11 @@ export class DockerRuntime {
           t: opts.tag,
           rm: true,
           forcerm: true,
-          // BuildKit endpoint (/build?version=2): the legacy builder's
-          // completion callback lags the real end by tens of seconds on
-          // Windows named pipes.
-          version: '2',
+          // The BuildKit endpoint intermittently leaves build streams open on
+          // Docker Desktop. The legacy endpoint is slower to report completion
+          // on Windows, but the image-tag poll below provides deterministic
+          // completion without wedging the deployment queue.
+          version: '1',
           ...(opts.dockerfile && opts.dockerfile !== 'Dockerfile' ? { dockerfile: opts.dockerfile } : {}),
         },
       );
@@ -435,6 +436,20 @@ export class DockerRuntime {
     }
   }
 
+  /**
+   * Resolve a tag to its immutable image digest (sha256:...). Identity is the
+   * only safe anchor for rollback equivalence: the same digest means Docker
+   * considers the two labels the same image content. Returns null when the
+   * image is missing.
+   */
+  async imageDigest(tag: string): Promise<string | null> {
+    try {
+      const inspect = await this.docker.getImage(tag).inspect();
+      return inspect.Id ?? null;
+    } catch {
+      return null;
+    }
+  }
   async stats(id: string): Promise<ContainerStats | null> {
     let raw: Dockerode.ContainerStats;
     try {

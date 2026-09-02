@@ -139,10 +139,6 @@ describe('rollback (real docker)', () => {
     const bRow = (await ctx.app.inject({ method: 'GET', url: `/api/deployments/${depB}` })).json();
     expect(await (await fetch(`http://127.0.0.1:${bRow.hostPort}/version`)).text()).toBe('revision-b\n');
 
-    const beforeA = (await ctx.app.inject({ method: 'GET', url: `/api/deployments/${depA}` })).json();
-    const beforeB = (await ctx.app.inject({ method: 'GET', url: `/api/deployments/${depB}` })).json();
-    console.log('PROBE before', { A: beforeA.status, B: beforeB.status });
-
     // Roll the application back to revision A.
     const res = await ctx.app.inject({
       method: 'POST',

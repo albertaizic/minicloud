@@ -183,37 +183,90 @@ export class Gateway {
 
   /**
    * End-to-end verification through the gateway itself (not the container
-   * directly): proves the route table actually serves the slug.
+   * directly): proves the route table actually serves the slug AND — when
+   * `opts.expectedDeploymentId` is supplied — that the route table points at
+   * the intended deployment. Without the identity check, a healthy 200 from a
+   * stale upstream would pass; the platform must verify its own routing
+   * target without requiring applications to expose MiniCloud-specific
+   * version strings (see #9 of the rollback correctness brief).
    */
-  verifyRoute(slug: string, path: string, attempts = 3, timeoutMs = 4000): Promise<boolean> {
-    const attemptOnce = () =>
-      new Promise<boolean>((resolve) => {
-        const req = http.request(
-          { host: this.host, port: this.port, path, headers: { host: `${slug}.localhost` }, timeout: timeoutMs },
-          (res) => {
-            // Any response from a REAL upstream proves the route works —
-            // including 5xx from the app (health semantics belong to the
-            // deployment health check). 404/502/503 are gateway-generated
-            // errors meaning the route does not reach a live upstream.
-            const status = res.statusCode ?? 500;
-            res.resume();
-            resolve(status !== 404 && status !== 502 && status !== 503);
-          },
-        );
-        req.on('timeout', () => {
-          req.destroy();
-          resolve(false);
-        });
-        req.on('error', () => resolve(false));
-        req.end();
-      });
-    return (async () => {
-      for (let i = 0; i < attempts; i++) {
-        if (await attemptOnce()) return true;
-        await new Promise((r) => setTimeout(r, 750));
+  async verifyRoute(
+    slug: string,
+    path: string,
+    opts: { expectedDeploymentId?: string; attempts?: number; timeoutMs?: number } = {},
+  ): Promise<boolean> {
+    const attempts = opts.attempts ?? 3;
+    const timeoutMs = opts.timeoutMs ?? 4000;
+    const expected = opts.expectedDeploymentId ?? null;
+    for (let i = 0; i < attempts; i++) {
+      if (expected) {
+        // Identity-strong path: introspect the route table through the
+        // in-process admin endpoint. The route's deploymentId MUST equal the
+        // intended deployment; otherwise the gateway is pointing at a
+        // different upstream than the engine asked for.
+        const actual = await this.introspectRouteDeploymentId(slug, timeoutMs);
+        if (actual === expected) {
+          // Confirm the upstream is actually serving traffic (not just a stale
+          // route pointing at a stopped container). Any 2xx-5xx from a real
+          // upstream counts; only gateway-generated 404/502/503 mean the route
+          // is not live.
+          if (await this.probeLive(slug, path, timeoutMs)) return true;
+        }
+      } else if (await this.probeLive(slug, path, timeoutMs)) {
+        return true;
       }
-      return false;
-    })();
+      await new Promise((r) => setTimeout(r, 750));
+    }
+    return false;
+  }
+
+  /** Hit the in-process admin endpoint and read the route's deploymentId. */
+  private introspectRouteDeploymentId(slug: string, timeoutMs: number): Promise<string | null> {
+    return new Promise((resolve) => {
+      const req = http.request(
+        {
+          host: this.host,
+          port: this.port,
+          path: `/__minicloud__/route-info/${encodeURIComponent(slug)}`,
+          method: 'GET',
+          timeout: timeoutMs,
+        },
+        (res) => {
+          const chunks: Buffer[] = [];
+          res.on('data', (c) => chunks.push(c));
+          res.on('end', () => {
+            try {
+              const body = JSON.parse(Buffer.concat(chunks).toString('utf8')) as {
+                deploymentId?: string | null;
+              };
+              resolve(body.deploymentId ?? null);
+            } catch {
+              resolve(null);
+            }
+          });
+        },
+      );
+      req.on('timeout', () => { req.destroy(); resolve(null); });
+      req.on('error', () => resolve(null));
+      req.end();
+    });
+  }
+
+  /** Legacy liveness probe: any non-gateway response from the upstream. */
+  private probeLive(slug: string, path: string, timeoutMs: number): Promise<boolean> {
+    return new Promise((resolve) => {
+      const req = http.request(
+        { host: this.host, port: this.port, path, headers: { host: `${slug}.localhost` }, timeout: timeoutMs },
+        (res) => {
+          const status = res.statusCode ?? 500;
+          res.resume();
+          resolve(status !== 404 && status !== 502 && status !== 503);
+        },
+      );
+      req.on('timeout', () => { req.destroy(); resolve(false); });
+      req.on('error', () => resolve(false));
+      req.end();
+    });
   }
 
   // ---- request handling ------------------------------------------------------
@@ -228,6 +281,19 @@ export class Gateway {
   }
 
   private async handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    // Admin route: introspect a route's current upstream identity. The
+    // well-known path /__minicloud__/route-info/<slug> bypasses normal
+    // slug routing and reports the route table for the engine's
+    // identity-strong verifyRoute. The gateway is bound to localhost, so
+    // this endpoint is only reachable from the API process and tests.
+    if (req.url?.startsWith('/__minicloud__/route-info/')) {
+      const slug = decodeURIComponent(req.url.slice('/__minicloud__/route-info/'.length).split('?')[0] ?? '');
+      const route = slug ? this.routes.get(slug) : null;
+      this.respond(res, route ? 200 : 404, route
+        ? { slug, deploymentId: route.deploymentId, host: route.host, port: route.port, activeSince: route.activeSince.toISOString() }
+        : { error: 'no route for slug', slug });
+      return;
+    }
     const slug = slugFromHost(req.headers.host);
     if (!slug) {
       this.respond(res, 404, { error: 'Unknown host. Applications are served at http://<app>.localhost:<gateway-port>.' });
