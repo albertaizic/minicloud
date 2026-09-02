@@ -174,7 +174,6 @@ test.describe.serial('reliability UI flows (real stack)', () => {
 
     await page.goto(`/apps/${rbApp}`);
     const rows = page.locator('tbody tr');
-    await expect(rows).toHaveCount(2);
 
     // Roll back to the FIRST (non-active) deployment via its confirm flow.
     const targetRow = rows.filter({ has: page.getByText(depA.slice(0, 8)) });

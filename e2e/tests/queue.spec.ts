@@ -171,7 +171,7 @@ test.describe.serial('queue & preview UI (v0.7)', () => {
 
     // Dashboard: preview panel shows PR #7 with PREVIEW label and its own URL.
     await page.goto(`/apps/${previewAppId}`);
-    await expect(page.getByRole('heading', { name: /preview environments/i })).toBeVisible();
+    await expect(page.getByRole('heading', { name: /preview environments/i }).first()).toBeVisible();
     const row = page.locator('tr', { hasText: 'PR #7' }).first();
     await expect(row).toBeVisible({ timeout: 30_000 });
     await expect(row.getByText('PREVIEW', { exact: true })).toBeVisible();
