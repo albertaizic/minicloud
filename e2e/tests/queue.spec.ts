@@ -119,11 +119,10 @@ test.describe.serial('queue & preview UI (v0.7)', () => {
     const body = (await dres.json()) as { deployment: { id: string } };
     // Reach RUNNING via the API first: the page's metrics note also contains
     // the word RUNNING when queued, which would match too early.
-    for (let i = 0; i < 300; i++) {
-      const d = (await apiGet(`/api/deployments/${body.deployment.id}`)) as { status: string };
-      if (d.status === 'RUNNING') break;
-      await new Promise((r) => setTimeout(r, 1000));
-    }
+    await expect.poll(
+      async () => ((await apiGet(`/api/deployments/${body.deployment.id}`)) as { status: string }).status,
+      { timeout: 300_000, intervals: [1_000] },
+    ).toBe('RUNNING');
     await page.goto(`/deployments/${body.deployment.id}`);
     await expect(page.locator('.detail-grid .badge', { hasText: /running/i })).toBeVisible({ timeout: 30_000 });
     // Build cache line renders for real builds and exact reuse alike.
@@ -195,8 +194,10 @@ test.describe.serial('queue & preview UI (v0.7)', () => {
       if (d.status === 'RUNNING') break;
       await new Promise((r) => setTimeout(r, 1000));
     }
-    const servedB = await requestThroughGateway(8081, `pr-7-${previewSlug}.localhost`, '/version');
-    expect(servedB.body.trim()).toBe('revision-b');
+    await expect.poll(
+      async () => (await requestThroughGateway(8081, `pr-7-${previewSlug}.localhost`, '/version')).body.trim(),
+      { timeout: 60_000, intervals: [500] },
+    ).toBe('revision-b');
 
     // The dashboard reflects the new head SHA on the preview row.
     await page.goto(`/apps/${previewAppId}`);
