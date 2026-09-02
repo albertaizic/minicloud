@@ -71,14 +71,22 @@ solve, at an understandable scale.
 
 ```mermaid
 graph LR
-    CLI[minicloud CLI] --> API[Fastify API]
-    UI[Dashboard] --> API
-    API --> ENG[Deployment Engine]
-    ENG --> D[(PostgreSQL)]
-    ENG --> DK[Docker: build/run/health-check]
+    CLI["Command-line client"] --> API["MiniCloud API"]
+    UI["Web dashboard"] --> API
+    API --> ENGINE["Deployment engine"]
+    ENGINE --> DB[("PostgreSQL")]
+    ENGINE --> DOCKER["Docker"]
+```
 
-See [docs/architecture.md](docs/architecture.md) for the full architecture,
-deployment lifecycle, and reconciliation strategy.
+MiniCloud keeps the interface deliberately small: use the CLI or dashboard to
+request a deployment, then the API records it and hands the work to the
+deployment engine. The engine builds and runs containers through Docker while
+PostgreSQL preserves application, deployment, and recovery state. This split
+means the dashboard and command-line client can show the same durable status,
+even after the API restarts.
+
+For a deeper look at deployment states, routing, and recovery after a restart,
+read [the architecture guide](docs/architecture.md).
 
 ## Prerequisites
 
