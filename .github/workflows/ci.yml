@@ -111,8 +111,10 @@ jobs:
           PGPASSWORD=minicloud psql -h localhost -p 5433 -U minicloud -d postgres -c "SELECT datname FROM pg_database WHERE datname = 'minicloud_e2e';"
       - name: Run Playwright suite
         run: |
-          npx playwright test --config=e2e/playwright.config.ts --reporter=line,json
-          npx playwright test --config=e2e/playwright.config.ts --reporter=json --output=playwright-results.json 2>&1 || true
+          set +e
+          PLAYWRIGHT_JSON_OUTPUT_NAME=playwright-results.json npx playwright test --config=e2e/playwright.config.ts --reporter=line,json
+          status=$?
+          exit $status
         env:
           CI: 'true'
       - name: Upload Playwright results
