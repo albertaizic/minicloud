@@ -114,6 +114,9 @@ jobs:
           set +e
           PLAYWRIGHT_JSON_OUTPUT_FILE="$GITHUB_WORKSPACE/playwright-results.json" npx playwright test --config=e2e/playwright.config.ts --reporter=line,json
           status=$?
+          if [ "$status" -ne 0 ]; then
+            node -e "const report=JSON.parse(require('node:fs').readFileSync('playwright-results.json','utf8')); const visit=(value)=>{if(!value||typeof value!=='object')return;if(Array.isArray(value.errors))for(const error of value.errors)console.log('::error::'+String(error.message||error).replace(/\n/g,' '));for(const child of Object.values(value))visit(child)};visit(report)"
+          fi
           exit $status
         env:
           CI: 'true'
