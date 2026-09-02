@@ -138,6 +138,7 @@ describe('rollback (real docker)', () => {
     await waitForStatus(depB, ['RUNNING']);
     const bRow = (await ctx.app.inject({ method: 'GET', url: `/api/deployments/${depB}` })).json();
     expect(await (await fetch(`http://127.0.0.1:${bRow.hostPort}/version`)).text()).toBe('revision-b\n');
+    const beforeA = (await ctx.app.inject({ method: 'GET', url: `/api/deployments/${depA}` })).json();
 
     // Roll the application back to revision A.
     const res = await ctx.app.inject({
