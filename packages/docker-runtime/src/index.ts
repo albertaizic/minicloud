@@ -156,11 +156,10 @@ export class DockerRuntime {
           t: opts.tag,
           rm: true,
           forcerm: true,
-          // The BuildKit endpoint intermittently leaves build streams open on
-          // Docker Desktop. The legacy endpoint is slower to report completion
-          // on Windows, but the image-tag poll below provides deterministic
-          // completion without wedging the deployment queue.
-          version: '1',
+          // BuildKit endpoint (/build?version=2): the legacy builder's
+          // completion callback lags the real end by tens of seconds on
+          // Windows named pipes.
+          version: '2',
           ...(opts.dockerfile && opts.dockerfile !== 'Dockerfile' ? { dockerfile: opts.dockerfile } : {}),
         },
       );
